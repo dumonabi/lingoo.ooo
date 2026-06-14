@@ -49,7 +49,7 @@ function createLimiter({ windowMs, max, message }) {
 
 export const converseRateLimit = createLimiter({
   windowMs: 60 * 60 * 1000,
-  max: 200,
+  max: 100,
   message: 'Too many messages this hour — try again later',
 });
 

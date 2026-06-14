@@ -91,7 +91,7 @@ In Vercel → your project → **Settings** → **Domains**, add your own domain
 |--------|-----|
 | `API key not configured` | Add `OPENAI_API_KEY` in Vercel → Settings → Environment Variables, then **Redeploy** |
 | `Unauthorized` / access screen | Add `APP_PASSWORD` in Vercel, redeploy, share the code with users |
-| `Too many messages this hour` | Rate limit (200 messages/hour per IP). Wait or adjust in `server/security.js` |
+| `Too many messages this hour` | Rate limit (100 messages/hour per IP). Wait or adjust in `server/security.js` |
 | Function timeout / 504 | Upgrade to Vercel Pro, or use shorter voice messages |
 | Mic not working | Use **Chrome** or **Safari**, allow microphone permission, site must be **HTTPS** (Vercel provides this) |
 | Build failed | Check Vercel build logs; run `npm run build` locally first |
