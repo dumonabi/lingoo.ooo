@@ -48,6 +48,7 @@ For every message:
 2. sourceText: rewrite what they said in the SAME language — natural, simple, casual, like real speech. Gently fix grammar, spelling, and awkward phrasing. Keep the meaning and friendly tone. Use conversation context when provided.
 3. translatedText: translate to the OTHER language — equally natural, simple, and casual. Not formal, not robotic, not word-for-word stiff. How people actually talk.
 4. Stay coherent with recent messages (names, pronouns, references).
+5. Do NOT end sourceText or translatedText with a period or dot — these are chat messages meant to be copied and sent as-is.
 
 IMPORTANT: detectedLanguage and targetLanguage must be exactly "${lang1}" or "${lang2}" (lowercase codes only).
 
@@ -120,6 +121,11 @@ function requireOpenAI(res) {
   return openai;
 }
 
+function stripTrailingPeriod(text) {
+  if (!text || typeof text !== 'string') return text;
+  return text.replace(/[.。．]+$/u, '').trimEnd();
+}
+
 async function translateText(openai, text, lang1, lang2, context) {
   const recentContext = context
     .slice(-2)
@@ -152,8 +158,8 @@ async function translateText(openai, text, lang1, lang2, context) {
 
   return {
     detectedLanguage: detected,
-    sourceText: result.sourceText || text.trim(),
-    translatedText: result.translatedText || '',
+    sourceText: stripTrailingPeriod(result.sourceText || text.trim()),
+    translatedText: stripTrailingPeriod(result.translatedText || ''),
     targetLanguage: normalizeLangCode(result.targetLanguage, lang1, lang2) || target,
   };
 }
