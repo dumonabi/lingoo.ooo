@@ -6,6 +6,15 @@ import OpenAI, { toFile } from 'openai';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { LANGUAGE_NAMES, getLanguagesList } from './languages.js';
+import {
+  authVerifyRateLimit,
+  converseRateLimit,
+  getCorsOptions,
+  isAuthRequired,
+  requireAppAuth,
+  speakRateLimit,
+  verifyPassword,
+} from './security.js';
 
 dotenv.config();
 
@@ -170,21 +179,35 @@ async function generateSpeech(openai, text) {
 export function createApp() {
   const app = express();
 
-  app.use(cors());
+  app.set('trust proxy', 1);
+  app.use(cors(getCorsOptions()));
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({
       ok: true,
-      hasApiKey: Boolean(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== 'sk-your-openai-api-key-here'),
+      authRequired: isAuthRequired(),
     });
   });
 
-  app.get('/api/languages', (_req, res) => {
+  app.post('/api/auth/verify', authVerifyRateLimit, (req, res) => {
+    if (!isAuthRequired()) {
+      return res.json({ ok: true });
+    }
+
+    const { password } = req.body || {};
+    if (verifyPassword(password)) {
+      return res.json({ ok: true });
+    }
+
+    res.status(401).json({ error: 'Wrong access code' });
+  });
+
+  app.get('/api/languages', requireAppAuth, (_req, res) => {
     res.json(getLanguagesList());
   });
 
-  app.post('/api/converse', upload.single('audio'), async (req, res) => {
+  app.post('/api/converse', requireAppAuth, converseRateLimit, upload.single('audio'), async (req, res) => {
     const openai = requireOpenAI(res);
     if (!openai) return;
 
@@ -230,7 +253,7 @@ export function createApp() {
     }
   });
 
-  app.post('/api/speak', async (req, res) => {
+  app.post('/api/speak', requireAppAuth, speakRateLimit, async (req, res) => {
     const openai = requireOpenAI(res);
     if (!openai) return;
 

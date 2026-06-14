@@ -1,9 +1,12 @@
 import { createLangPicker, renderFlag } from './lang-picker.js';
 import { CHAMELEON_LOGO_SVG } from './chameleon-logo.js';
+import { apiFetch, clearAuthToken, getAuthToken, setAuthToken } from './auth.js';
 
 const STORAGE_KEY = 'lingo-languages';
 const DEFAULT_LANG1 = 'en';
 const DEFAULT_LANG2 = 'zh';
+
+let authRequired = false;
 
 const state = {
   languages: [],
@@ -44,7 +47,7 @@ function langMeta(fromCode, toCode) {
 function prefetchAudio(msg) {
   if (msg._audioPromise) return msg._audioPromise;
 
-  msg._audioPromise = fetch('/api/speak', {
+  msg._audioPromise = apiFetch('/api/speak', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text: msg.translated, lang: msg.targetLanguage }),
@@ -60,17 +63,92 @@ function prefetchAudio(msg) {
 
 async function init() {
   $('#logo-icon').innerHTML = CHAMELEON_LOGO_SVG;
+  $('#auth-logo').innerHTML = CHAMELEON_LOGO_SVG;
+
+  const ready = await checkHealth();
+  if (!ready) return;
+
+  const authed = await ensureAuthenticated();
+  if (!authed) return;
+
   await loadLanguages();
   initPickers();
   bindEvents();
-  checkHealth();
   checkMicSupport();
   updateMicState();
 }
 
+async function ensureAuthenticated() {
+  if (!authRequired) return true;
+
+  if (getAuthToken()) {
+    const res = await apiFetch('/api/languages');
+    if (res.ok) return true;
+    clearAuthToken();
+  }
+
+  return showAuthGate();
+}
+
+function showAuthGate() {
+  const gate = $('#auth-gate');
+  const form = $('#auth-form');
+  const input = $('#auth-input');
+  const errorEl = $('#auth-error');
+  const submitBtn = $('#auth-submit');
+
+  gate.hidden = false;
+  input.value = '';
+  errorEl.hidden = true;
+
+  return new Promise((resolve) => {
+    const onUnauthorized = () => {
+      gate.hidden = false;
+      errorEl.textContent = 'Session expired — enter the code again';
+      errorEl.hidden = false;
+      resolve(false);
+    };
+
+    window.addEventListener('lingo:unauthorized', onUnauthorized, { once: true });
+
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      errorEl.hidden = true;
+      submitBtn.disabled = true;
+
+      try {
+        const password = input.value.trim();
+        const res = await fetch('/api/auth/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password }),
+        });
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          errorEl.textContent = data.error || 'Wrong access code';
+          errorEl.hidden = false;
+          return;
+        }
+
+        setAuthToken(password);
+        gate.hidden = true;
+        window.removeEventListener('lingo:unauthorized', onUnauthorized);
+        resolve(true);
+      } catch {
+        errorEl.textContent = 'Could not connect — try again';
+        errorEl.hidden = false;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    };
+  });
+}
+
 async function loadLanguages() {
   try {
-    const res = await fetch('/api/languages');
+    const res = await apiFetch('/api/languages');
+    if (!res.ok) throw new Error('Failed to load languages');
     state.languages = await res.json();
   } catch {
     state.languages = [
@@ -146,11 +224,11 @@ async function checkHealth() {
   try {
     const res = await fetch('/api/health');
     const data = await res.json();
-    if (!data.hasApiKey) {
-      showToast('Add your OpenAI API key to the .env file');
-    }
+    authRequired = Boolean(data.authRequired);
+    return true;
   } catch {
     showToast('Run: npm run dev');
+    return false;
   }
 }
 
@@ -238,11 +316,13 @@ async function stopRecording() {
     form.append('lang2', state.lang2);
     form.append('context', JSON.stringify(state.messages));
 
-    const res = await fetch('/api/converse', { method: 'POST', body: form }).catch(() => {
+    const res = await apiFetch('/api/converse', { method: 'POST', body: form }).catch(() => {
       throw new Error('Cannot connect to server');
     });
 
     const data = await res.json();
+    if (res.status === 429) throw new Error(data.error || 'Too many messages this hour');
+    if (res.status === 401) throw new Error('Session expired — refresh and enter the code again');
     if (!res.ok) throw new Error(data.error || 'Processing failed');
     if (!data.translatedText?.trim()) throw new Error('Could not translate');
 
@@ -360,6 +440,9 @@ function escapeHtml(str) {
 
 function bindEvents() {
   mainMicBtn.addEventListener('click', toggleRecording);
+  window.addEventListener('lingo:unauthorized', () => {
+    if (authRequired) showAuthGate();
+  });
 }
 
 init();

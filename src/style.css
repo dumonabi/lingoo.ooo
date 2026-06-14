@@ -382,6 +382,96 @@ body {
 
 .toast[hidden] { display: none; }
 
+.auth-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: rgba(6, 12, 10, 0.88);
+  backdrop-filter: blur(8px);
+}
+
+.auth-gate[hidden] { display: none; }
+
+.auth-card {
+  width: min(100%, 360px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.75rem 1.5rem;
+  text-align: center;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+}
+
+.auth-logo {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 0.75rem;
+}
+
+.auth-logo .chameleon-logo {
+  width: 2.25rem;
+  height: 2.25rem;
+}
+
+.auth-card h2 {
+  font-size: 1.35rem;
+  margin-bottom: 0.35rem;
+}
+
+.auth-hint {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-bottom: 1.25rem;
+}
+
+.auth-input {
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 12px;
+  padding: 0.85rem 1rem;
+  font: inherit;
+  font-size: 1rem;
+  margin-bottom: 0.85rem;
+}
+
+.auth-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.auth-submit {
+  width: 100%;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-dark) 100%);
+  color: #052e16;
+  border: none;
+  border-radius: 12px;
+  padding: 0.85rem 1rem;
+  font: inherit;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.auth-submit:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.auth-error {
+  margin-top: 0.85rem;
+  color: #f87171;
+  font-size: 0.88rem;
+}
+
+.auth-error[hidden] { display: none; }
+
 @media (max-width: 480px) {
   .logo h1 { font-size: 1.75rem; }
   .chameleon-logo { width: 2.1rem; height: 2.1rem; }

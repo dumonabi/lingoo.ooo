@@ -49,18 +49,21 @@ Replace `TU_USUARIO` with your GitHub username.
 
 ---
 
-## Step 3 — Add your OpenAI API key
+## Step 3 — Environment variables
 
-Before clicking Deploy:
+Before clicking Deploy, open **Environment Variables** and add:
 
-1. Open **Environment Variables**.
-2. Add:
-   - **Name:** `OPENAI_API_KEY`
-   - **Value:** your key (starts with `sk-`)
-   - **Environments:** Production, Preview, Development (check all three)
-3. Click **Add**.
+| Name | Value | Environments |
+|------|--------|----------------|
+| `OPENAI_API_KEY` | your key (`sk-...`) | Production, Preview, Development |
+| `APP_PASSWORD` | a long access code you share with users | Production, Preview, Development |
 
-Never commit `.env` to GitHub — it stays only in Vercel.
+- **`OPENAI_API_KEY`** — required for transcription and translation.
+- **`APP_PASSWORD`** — optional but recommended. When set, users must enter this code once per browser session before using the app. Scripts without the code cannot call your API.
+
+Never commit `.env` to GitHub — secrets stay only in Vercel.
+
+**Also set a monthly spending limit** at [platform.openai.com/settings/organization/limits](https://platform.openai.com/settings/organization/limits).
 
 ---
 
@@ -87,6 +90,8 @@ In Vercel → your project → **Settings** → **Domains**, add your own domain
 | Problem | Fix |
 |--------|-----|
 | `API key not configured` | Add `OPENAI_API_KEY` in Vercel → Settings → Environment Variables, then **Redeploy** |
+| `Unauthorized` / access screen | Add `APP_PASSWORD` in Vercel, redeploy, share the code with users |
+| `Too many messages this hour` | Rate limit (200 messages/hour per IP). Wait or adjust in `server/security.js` |
 | Function timeout / 504 | Upgrade to Vercel Pro, or use shorter voice messages |
 | Mic not working | Use **Chrome** or **Safari**, allow microphone permission, site must be **HTTPS** (Vercel provides this) |
 | Build failed | Check Vercel build logs; run `npm run build` locally first |

@@ -37,6 +37,26 @@
 
     <div class="toast" id="toast" hidden></div>
 
+    <div class="auth-gate" id="auth-gate" hidden>
+      <div class="auth-card">
+        <span class="auth-logo" id="auth-logo" aria-hidden="true"></span>
+        <h2>Access code</h2>
+        <p class="auth-hint">Enter the code to start using Lingo.</p>
+        <form id="auth-form">
+          <input
+            type="password"
+            id="auth-input"
+            class="auth-input"
+            placeholder="Access code"
+            autocomplete="current-password"
+            required
+          />
+          <button type="submit" class="auth-submit" id="auth-submit">Continue</button>
+        </form>
+        <p class="auth-error" id="auth-error" hidden></p>
+      </div>
+    </div>
+
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
