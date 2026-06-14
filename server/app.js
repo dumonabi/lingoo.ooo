@@ -24,12 +24,17 @@ const upload = multer({
   limits: { fileSize: 4 * 1024 * 1024 },
 });
 
+let openaiClient = null;
+
 function getOpenAI() {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey || apiKey === 'sk-your-openai-api-key-here') {
     return null;
   }
-  return new OpenAI({ apiKey });
+  if (!openaiClient) {
+    openaiClient = new OpenAI({ apiKey });
+  }
+  return openaiClient;
 }
 
 function buildSystemPrompt(lang1, lang2) {
@@ -117,7 +122,7 @@ function requireOpenAI(res) {
 
 async function translateText(openai, text, lang1, lang2, context) {
   const recentContext = context
-    .slice(-4)
+    .slice(-2)
     .map((m) => `${m.detectedLanguage}: ${m.original} → ${m.translated}`)
     .join('\n');
 
@@ -128,7 +133,8 @@ async function translateText(openai, text, lang1, lang2, context) {
   const completion = await withRetry(() =>
     openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      temperature: 0.5,
+      temperature: 0.4,
+      max_tokens: 280,
       response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: buildSystemPrompt(lang1, lang2) },

@@ -4,7 +4,7 @@ import { apiFetch, clearAuthToken, getAuthToken, setAuthToken } from './auth.js'
 
 const STORAGE_KEY = 'lingo-languages';
 const DEFAULT_LANG1 = 'en';
-const DEFAULT_LANG2 = 'zh';
+const DEFAULT_LANG2 = 'es';
 
 let authRequired = false;
 
@@ -75,6 +75,7 @@ async function init() {
   initPickers();
   bindEvents();
   checkMicSupport();
+  warmMic();
   updateMicState();
 }
 
@@ -153,7 +154,7 @@ async function loadLanguages() {
   } catch {
     state.languages = [
       { code: 'en', name: 'English', flag: '🇺🇸', customFlag: null },
-      { code: 'zh', name: 'Chinese', flag: '🇨🇳', customFlag: null },
+      { code: 'es', name: 'Spanish', flag: '🇪🇸', customFlag: null },
     ];
   }
 }
@@ -184,7 +185,7 @@ function initPickers() {
   picker2 = createLangPicker($('#lang-picker-2'), {
     languages: state.languages,
     value: state.lang2,
-    placeholder: 'Chinese',
+    placeholder: 'Spanish',
     onChange: (code) => {
       state.lang2 = code;
       if (state.lang1 === state.lang2) {
@@ -239,6 +240,28 @@ function checkMicSupport() {
   }
 }
 
+async function warmMic() {
+  if (!navigator.mediaDevices?.getUserMedia) return;
+  if (state.mediaStream?.active) return;
+
+  try {
+    state.mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+  } catch {
+    // Permission will be requested on first tap.
+  }
+}
+
+async function ensureMicStream() {
+  if (state.mediaStream?.active) return state.mediaStream;
+
+  state.mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true },
+  });
+  return state.mediaStream;
+}
+
 function getMimeType() {
   const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'];
   return types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
@@ -260,7 +283,7 @@ async function toggleRecording() {
 
 async function startRecording() {
   try {
-    state.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    await ensureMicStream();
     state.audioChunks = [];
 
     const mimeType = getMimeType();
@@ -272,14 +295,14 @@ async function startRecording() {
       if (e.data.size > 0) state.audioChunks.push(e.data);
     };
 
-    state.mediaRecorder.start(100);
+    state.mediaRecorder.start();
     state.isRecording = true;
     mainMicBtn.classList.add('recording');
     liveTranscript.hidden = false;
-    liveTranscript.textContent = '…';
+    liveTranscript.textContent = 'Listening…';
   } catch (err) {
     showToast(err.name === 'NotAllowedError' ? 'Microphone permission denied' : 'Could not access microphone');
-    cleanupStream();
+    releaseMic();
   }
 }
 
@@ -289,7 +312,10 @@ async function stopRecording() {
   state.isRecording = false;
   state.isProcessing = true;
   mainMicBtn.classList.remove('recording');
+  mainMicBtn.classList.add('processing');
   mainMicBtn.disabled = true;
+  liveTranscript.hidden = false;
+  liveTranscript.textContent = 'Translating…';
 
   const mimeType = state.mediaRecorder.mimeType || 'audio/webm';
 
@@ -298,7 +324,7 @@ async function stopRecording() {
     state.mediaRecorder.stop();
   });
 
-  cleanupStream();
+  cleanupRecorder();
 
   const blob = new Blob(state.audioChunks, { type: mimeType });
   state.audioChunks = [];
@@ -314,7 +340,13 @@ async function stopRecording() {
     form.append('audio', blob, `audio.${mimeType.includes('mp4') ? 'mp4' : 'webm'}`);
     form.append('lang1', state.lang1);
     form.append('lang2', state.lang2);
-    form.append('context', JSON.stringify(state.messages));
+    form.append('context', JSON.stringify(
+      state.messages.slice(-2).map((m) => ({
+        detectedLanguage: m.detectedLanguage,
+        original: m.original,
+        translated: m.translated,
+      }))
+    ));
 
     const res = await apiFetch('/api/converse', { method: 'POST', body: form }).catch(() => {
       throw new Error('Cannot connect to server');
@@ -345,7 +377,11 @@ async function stopRecording() {
   }
 }
 
-function cleanupStream() {
+function cleanupRecorder() {
+  state.mediaRecorder = null;
+}
+
+function releaseMic() {
   state.mediaStream?.getTracks().forEach((t) => t.stop());
   state.mediaStream = null;
   state.mediaRecorder = null;
@@ -353,6 +389,7 @@ function cleanupStream() {
 
 function resetMicUI() {
   state.isProcessing = false;
+  mainMicBtn.classList.remove('processing');
   liveTranscript.hidden = true;
   liveTranscript.textContent = '';
   updateMicState();
@@ -443,6 +480,7 @@ function bindEvents() {
   window.addEventListener('lingo:unauthorized', () => {
     if (authRequired) showAuthGate();
   });
+  window.addEventListener('pagehide', releaseMic);
 }
 
 init();
