@@ -43,10 +43,18 @@ const toastEl = $('#toast');
 const mainMicBtn = $('#main-mic');
 const liveTranscript = $('#live-transcript');
 const micRingWrap = $('#mic-ring-wrap');
+const micWaveformEl = $('#mic-waveform');
 const progressRing = $('#progress-ring');
 const progressRingFill = $('#progress-ring-fill');
 
 const RING_CIRCUMFERENCE = 2 * Math.PI * 54;
+const MIC_WAVE_VISIBLE = 14;
+const MIC_WAVE_TOTAL = MIC_WAVE_VISIBLE + 1;
+const MIC_WAVE_SHIFT_MS = 46;
+const MIC_WAVE_BAR_STEP = 5;
+const MIC_BAR_IDLE = 0.05;
+const MIC_BAR_TRIGGER = 0.2;
+const MIC_VOICE_GATE = 0.1;
 
 let progressRaf = null;
 let recordingProgressRaf = null;
@@ -56,6 +64,11 @@ let pendingQueueBusy = false;
 let pendingRetryTimer = null;
 let micMeter = null;
 let micMeterCtx = null;
+let micWaveSlots = [];
+let micWaveBarEls = [];
+let micWaveScrollEl = null;
+let micWaveLastShift = 0;
+let micWaveShiftBusy = false;
 let selectedHistoryId = null;
 
 const COPY_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>';
@@ -595,11 +608,76 @@ function simulatedProgress(elapsedMs) {
   return Math.min(97 + (overtime / (target * 0.6)) * 2, 99);
 }
 
+const PROCESSING_COLOR_STOPS = [
+  { at: 0, r: 248, g: 113, b: 113 },
+  { at: 0.28, r: 251, g: 146, b: 60 },
+  { at: 0.55, r: 251, g: 191, b: 36 },
+  { at: 0.78, r: 163, g: 230, b: 53 },
+  { at: 1, r: 74, g: 222, b: 128 },
+];
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function processingRgb(pct) {
+  const t = Math.max(0, Math.min(1, pct / 100));
+  let start = PROCESSING_COLOR_STOPS[0];
+  let end = PROCESSING_COLOR_STOPS[PROCESSING_COLOR_STOPS.length - 1];
+
+  for (let i = 0; i < PROCESSING_COLOR_STOPS.length - 1; i++) {
+    if (t >= PROCESSING_COLOR_STOPS[i].at && t <= PROCESSING_COLOR_STOPS[i + 1].at) {
+      start = PROCESSING_COLOR_STOPS[i];
+      end = PROCESSING_COLOR_STOPS[i + 1];
+      const span = end.at - start.at || 1;
+      const local = (t - start.at) / span;
+      return {
+        r: Math.round(lerp(start.r, end.r, local)),
+        g: Math.round(lerp(start.g, end.g, local)),
+        b: Math.round(lerp(start.b, end.b, local)),
+      };
+    }
+  }
+
+  return { r: end.r, g: end.g, b: end.b };
+}
+
+function rgbCss({ r, g, b }, alpha = 1) {
+  return alpha === 1 ? `rgb(${r}, ${g}, ${b})` : `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function applyProcessingVisuals(pct) {
+  const rgb = processingRgb(pct);
+  const dark = {
+    r: Math.round(rgb.r * 0.58),
+    g: Math.round(rgb.g * 0.58),
+    b: Math.round(rgb.b * 0.58),
+  };
+
+  progressRingFill.style.stroke = rgbCss(rgb);
+  if (!mainMicBtn.classList.contains('processing')) return;
+
+  mainMicBtn.style.background = `linear-gradient(145deg, ${rgbCss(rgb)}, ${rgbCss(dark)})`;
+  mainMicBtn.style.boxShadow = `inset 0 0 0 2px ${rgbCss(rgb, 0.42)}, 0 4px 28px ${rgbCss(rgb, 0.28)}`;
+}
+
+function clearProcessingVisuals() {
+  progressRingFill.style.removeProperty('stroke');
+  mainMicBtn.style.removeProperty('background');
+  mainMicBtn.style.removeProperty('box-shadow');
+}
+
 function updateProgressRing(pct) {
   const value = Math.round(pct);
   const offset = RING_CIRCUMFERENCE * (1 - pct / 100);
   progressRingFill.style.strokeDashoffset = String(offset);
   progressRing.setAttribute('aria-valuenow', String(value));
+
+  if (micRingWrap.classList.contains('is-active')) {
+    applyProcessingVisuals(pct);
+  } else if (micRingWrap.classList.contains('is-recording')) {
+    progressRingFill.style.stroke = '#f87171';
+  }
 }
 
 function getMicMeterContext() {
@@ -682,18 +760,114 @@ function readMicLevel() {
   return micMeter.smooth;
 }
 
-function applyMicVoicePulse(level) {
-  const scale = 1 + level * 0.18;
-  const glow = level;
-  mainMicBtn.style.setProperty('--mic-voice-scale', scale.toFixed(3));
-  mainMicBtn.style.setProperty('--mic-voice-glow', glow.toFixed(3));
-  micRingWrap.style.setProperty('--mic-voice-glow', glow.toFixed(3));
+function ensureMicWaveform() {
+  if (!micWaveformEl || micWaveBarEls.length) return;
+
+  micWaveScrollEl = document.createElement('span');
+  micWaveScrollEl.className = 'mic-wave-scroll';
+  micWaveformEl.appendChild(micWaveScrollEl);
+
+  micWaveSlots = Array(MIC_WAVE_TOTAL).fill(MIC_BAR_IDLE);
+  for (let i = 0; i < MIC_WAVE_TOTAL; i++) {
+    const bar = document.createElement('span');
+    bar.className = 'mic-wave-bar';
+    bar.style.setProperty('--bar-scale', String(MIC_BAR_IDLE));
+    micWaveScrollEl.appendChild(bar);
+    micWaveBarEls.push(bar);
+  }
+}
+
+function isMicSilent(level) {
+  if (!micMeter) return true;
+
+  micMeter.analyser.getByteTimeDomainData(micMeter.timeData);
+  let sum = 0;
+  for (let i = 0; i < micMeter.timeData.length; i++) {
+    const sample = (micMeter.timeData[i] - 128) / 128;
+    sum += sample * sample;
+  }
+  const instant = Math.sqrt(sum / micMeter.timeData.length);
+  return level < MIC_VOICE_GATE && instant < 0.03;
+}
+
+function computeWaveSample(level, silent) {
+  if (silent || !micMeter) return MIC_BAR_IDLE;
+
+  micMeter.analyser.getByteFrequencyData(micMeter.freqData);
+  const voiceBins = Math.max(8, Math.floor(micMeter.freqData.length * 0.45));
+  let peak = 0;
+  for (let b = 2; b < 2 + voiceBins; b++) {
+    peak = Math.max(peak, micMeter.freqData[b] / 255);
+  }
+
+  const gated = Math.max(0, peak - MIC_BAR_TRIGGER) / (1 - MIC_BAR_TRIGGER);
+  if (gated < 0.04) return MIC_BAR_IDLE;
+
+  const boosted = Math.min(1, gated * (1.15 + level * 0.85));
+  const shaped = Math.pow(boosted, 1.45);
+  return MIC_BAR_IDLE + shaped * (1 - MIC_BAR_IDLE);
+}
+
+function finishMicWaveShift() {
+  if (!micWaveScrollEl || !micWaveBarEls.length) return;
+
+  const first = micWaveBarEls.shift();
+  first.style.setProperty('--bar-scale', String(MIC_BAR_IDLE));
+  micWaveScrollEl.appendChild(first);
+  micWaveBarEls.push(first);
+
+  micWaveScrollEl.style.transition = 'none';
+  micWaveScrollEl.style.transform = 'translateX(0)';
+  micWaveShiftBusy = false;
+}
+
+function shiftMicWaveform(sample) {
+  if (!micWaveScrollEl || !micWaveBarEls.length || micWaveShiftBusy) return;
+
+  micWaveShiftBusy = true;
+  micWaveSlots.shift();
+  micWaveSlots.push(sample);
+
+  const incoming = micWaveBarEls[micWaveBarEls.length - 1];
+  incoming.style.setProperty('--bar-scale', sample.toFixed(3));
+
+  micWaveScrollEl.style.transition = `transform ${MIC_WAVE_SHIFT_MS}ms linear`;
+  micWaveScrollEl.style.transform = `translateX(-${MIC_WAVE_BAR_STEP}px)`;
+
+  window.setTimeout(finishMicWaveShift, MIC_WAVE_SHIFT_MS);
+}
+
+function applyMicVoicePulse() {
+  const level = readMicLevel();
+  mainMicBtn.style.setProperty('--mic-voice-scale', (1 + level * 0.18).toFixed(3));
+  mainMicBtn.style.setProperty('--mic-voice-glow', level.toFixed(3));
+
+  ensureMicWaveform();
+  if (!micMeter) return;
+
+  const now = performance.now();
+  if (now - micWaveLastShift < MIC_WAVE_SHIFT_MS || micWaveShiftBusy) return;
+  micWaveLastShift = now;
+
+  const sample = computeWaveSample(level, isMicSilent(level));
+  shiftMicWaveform(sample);
 }
 
 function clearMicVoicePulse() {
   mainMicBtn.style.removeProperty('--mic-voice-scale');
   mainMicBtn.style.removeProperty('--mic-voice-glow');
-  micRingWrap.style.removeProperty('--mic-voice-glow');
+
+  micWaveLastShift = 0;
+  micWaveShiftBusy = false;
+  if (!micWaveBarEls.length) return;
+  micWaveSlots = Array(micWaveBarEls.length).fill(MIC_BAR_IDLE);
+  micWaveBarEls.forEach((bar) => {
+    bar.style.setProperty('--bar-scale', String(MIC_BAR_IDLE));
+  });
+  if (micWaveScrollEl) {
+    micWaveScrollEl.style.transition = 'none';
+    micWaveScrollEl.style.transform = 'translateX(0)';
+  }
 }
 
 function teardownMicMeter() {
@@ -729,7 +903,7 @@ async function startRecordingProgress() {
   const tick = () => {
     if (!state.isRecording) return;
 
-    applyMicVoicePulse(readMicLevel());
+    applyMicVoicePulse();
 
     const elapsed = Date.now() - state.recordingStartedAt;
     updateProgressRing(Math.min((elapsed / MAX_RECORDING_MS) * 100, 100));
@@ -755,6 +929,7 @@ function startProgress(estimatedMs) {
   micRingWrap.classList.add('is-active');
   progressRing.setAttribute('aria-label', 'Translation progress');
   updateProgressRing(0);
+  applyProcessingVisuals(0);
 
   const tick = (now) => {
     const elapsed = now - progressStartedAt;
@@ -782,6 +957,7 @@ function stopProgress() {
   progressRaf = null;
   micRingWrap.classList.remove('is-active');
   micRingWrap.classList.remove('is-recording');
+  clearProcessingVisuals();
 }
 
 function buildConversationContext() {
@@ -977,6 +1153,8 @@ async function processPendingQueue() {
 
     try {
       state.isProcessing = true;
+      mainMicBtn.classList.add('processing');
+      mainMicBtn.setAttribute('aria-label', 'Translating…');
       mainMicBtn.disabled = true;
       startProgress(estimateProcessingMs(item.recordingMs, item.blob?.size || 0));
 
@@ -1066,6 +1244,7 @@ async function startRecording() {
   try {
     await ensureMicStream();
     await prepareMicMeter(state.mediaStream);
+    clearMicVoicePulse();
     state.audioChunks = [];
 
     const mimeType = getMimeType();
@@ -1097,6 +1276,7 @@ async function stopRecording() {
   state.isProcessing = true;
   mainMicBtn.classList.remove('recording');
   mainMicBtn.classList.add('processing');
+  mainMicBtn.setAttribute('aria-label', 'Translating…');
   mainMicBtn.disabled = true;
   liveTranscript.hidden = true;
   stopRecordingProgress();
@@ -1174,6 +1354,7 @@ function resetMicUI() {
   releaseMic();
   state.isProcessing = false;
   mainMicBtn.classList.remove('processing');
+  clearProcessingVisuals();
   liveTranscript.hidden = true;
   liveTranscript.textContent = '';
   updateProgressRing(0);

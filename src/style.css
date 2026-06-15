@@ -283,17 +283,11 @@ body {
   stroke-linecap: round;
   stroke-dasharray: 339.292;
   stroke-dashoffset: 339.292;
-  transition: stroke-dashoffset 0.12s linear;
+  transition: stroke-dashoffset 0.12s linear, stroke 0.18s ease;
 }
 
 .mic-ring-wrap.is-recording .mic-progress-fill {
   stroke: #f87171;
-  stroke-width: calc(5px + var(--mic-voice-glow, 0) * 3px);
-  transition: stroke-width 0.06s ease-out;
-}
-
-.mic-ring-wrap.is-active .mic-progress-fill {
-  stroke: var(--accent-light);
 }
 
 .main-mic-btn {
@@ -311,9 +305,46 @@ body {
   box-shadow: 0 4px 32px var(--accent-glow);
 }
 
-.main-mic-btn svg {
+.mic-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mic-icon svg {
   width: 42px;
   height: 42px;
+}
+
+.mic-waveform {
+  display: none;
+  width: calc(var(--mic-wave-step, 5px) * var(--mic-wave-visible, 14));
+  overflow: hidden;
+  align-items: center;
+  justify-content: flex-start;
+  height: 50px;
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 12%, #000 88%, transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0%, #000 12%, #000 88%, transparent 100%);
+}
+
+.mic-wave-scroll {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 48px;
+  min-width: max-content;
+  will-change: transform;
+}
+
+.mic-wave-bar {
+  width: 3px;
+  height: 48px;
+  flex-shrink: 0;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.95);
+  transform: scaleY(var(--bar-scale, 0.05));
+  transform-origin: center center;
+  will-change: transform;
 }
 
 .main-mic-btn:hover:not(:disabled) {
@@ -332,17 +363,26 @@ body {
   transition: transform 0.05s ease-out, box-shadow 0.06s ease-out, background 0.06s ease-out;
 }
 
-.main-mic-btn.processing {
-  opacity: 1;
-  background: linear-gradient(145deg, #fbbf24, #d97706);
-  box-shadow: 0 4px 32px rgba(251, 191, 36, 0.4);
-  animation: pulse-processing 0.9s infinite;
-  cursor: default;
+.main-mic-btn.recording .mic-icon {
+  display: none;
 }
 
-@keyframes pulse-processing {
-  0%, 100% { box-shadow: 0 4px 32px rgba(251, 191, 36, 0.4); }
-  50% { box-shadow: 0 6px 40px rgba(251, 191, 36, 0.55); }
+.main-mic-btn.recording .mic-waveform {
+  display: flex;
+}
+
+.main-mic-btn.processing {
+  opacity: 1;
+  background: rgba(28, 14, 14, 0.92);
+  box-shadow: inset 0 0 0 2px rgba(248, 113, 113, 0.35);
+  cursor: default;
+  transform: none;
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.main-mic-btn.processing .mic-icon,
+.main-mic-btn.processing .mic-waveform {
+  display: none;
 }
 
 .main-mic-btn:disabled:not(.processing) {
@@ -908,8 +948,22 @@ body {
     height: 88px;
   }
 
-  .main-mic-btn svg {
+  .mic-icon svg {
     width: 38px;
     height: 38px;
+  }
+
+  .mic-waveform {
+    width: calc(var(--mic-wave-step, 5px) * var(--mic-wave-visible, 14));
+    height: 44px;
+  }
+
+  .mic-wave-scroll {
+    height: 42px;
+  }
+
+  .mic-wave-bar {
+    width: 3px;
+    height: 42px;
   }
 }
