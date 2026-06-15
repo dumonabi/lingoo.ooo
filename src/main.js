@@ -5,6 +5,7 @@ import { apiFetch, clearAuthToken, getAuthToken, setAuthToken } from './auth.js'
 const STORAGE_KEY = 'lingo-languages';
 const DEFAULT_LANG1 = 'en';
 const DEFAULT_LANG2 = 'es';
+const MAX_RECORDING_MS = 60_000;
 
 let authRequired = false;
 
@@ -36,6 +37,7 @@ const progressTrack = $('#progress-track');
 const progressFill = $('#progress-fill');
 
 let progressRaf = null;
+let recordingProgressRaf = null;
 let progressStartedAt = 0;
 let progressEstimateMs = 4000;
 
@@ -53,20 +55,45 @@ function langMeta(fromCode, toCode) {
 }
 
 function prefetchAudio(msg) {
-  if (msg._audioPromise) return msg._audioPromise;
+  return loadMessageAudio(msg);
+}
+
+async function loadMessageAudio(msg, { retry = false } = {}) {
+  if (msg.audioUrl) return;
+
+  if (msg._audioPromise && !retry) {
+    try {
+      await msg._audioPromise;
+    } catch {
+      msg._audioPromise = null;
+    }
+    if (msg.audioUrl) return;
+  }
 
   msg._audioPromise = apiFetch('/api/speak', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text: msg.translated, lang: msg.targetLanguage }),
-  })
-    .then(async (res) => {
-      if (!res.ok) throw new Error('Audio failed');
-      msg.audioUrl = URL.createObjectURL(await res.blob());
-    })
-    .catch(() => {});
+  }).then(async (res) => {
+    let errMsg = 'Audio not ready — tap Listen again';
+    if (!res.ok) {
+      try {
+        const data = await res.json();
+        errMsg = data.error || errMsg;
+      } catch {
+        if (res.status === 429) errMsg = 'Too many audio requests — wait a moment';
+      }
+      throw new Error(errMsg);
+    }
+    msg.audioUrl = URL.createObjectURL(await res.blob());
+  });
 
-  return msg._audioPromise;
+  try {
+    await msg._audioPromise;
+  } catch (err) {
+    msg._audioPromise = null;
+    throw err;
+  }
 }
 
 async function init() {
@@ -84,7 +111,6 @@ async function init() {
   bindEvents();
   bindMicHelp();
   checkMicSupport();
-  warmMic();
   updateMicState();
 }
 
@@ -229,45 +255,107 @@ function onLanguagesChanged() {
   updateMicState();
 }
 
+function detectBrowser() {
+  const ua = navigator.userAgent;
+  const isIOS = /iPhone|iPad|iPod/i.test(ua);
+  const isAndroid = /Android/i.test(ua);
+  const isSafari = /Safari/i.test(ua) && !/Chrome|CriOS|Chromium|Edg|OPR|FxiOS/i.test(ua);
+  const isChrome = /Chrome|CriOS/i.test(ua) && !/Edg/i.test(ua);
+
+  if (isIOS && isSafari) return 'ios-safari';
+  if (isIOS && isChrome) return 'ios-chrome';
+  if (isIOS) return 'ios-other';
+  if (isAndroid && isChrome) return 'android-chrome';
+  if (isAndroid) return 'android-other';
+  if (isSafari) return 'desktop-safari';
+  if (isChrome) return 'desktop-chrome';
+  return 'generic';
+}
+
+function genericMicSteps() {
+  return [
+    'Connect or enable a microphone on your device',
+    'Allow microphone access when your browser asks',
+    'If you already denied it: open this site\'s settings (lock or “aA” icon in the address bar) and set Microphone to Allow',
+    'Reload the page, then tap Try again',
+  ];
+}
+
 function getMicHelp(err) {
-  const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
-  const isAndroid = /Android/i.test(navigator.userAgent);
+  const browser = detectBrowser();
   const denied = err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError';
   const notFound = err?.name === 'NotFoundError' || err?.name === 'DevicesNotFoundError';
 
   if (denied) {
-    if (isIOS) {
+    if (browser === 'ios-safari') {
       return {
-        title: 'Allow microphone on iPhone',
-        intro: 'Chrome needs permission to use your microphone.',
+        title: 'Allow microphone in Safari',
+        intro: 'Safari needs permission to use your microphone.',
         steps: [
-          'Open the iPhone Settings app',
-          'Scroll down and tap Chrome',
-          'Turn Microphone ON',
+          'Open iPhone Settings → Safari → Microphone → Allow',
+          'Or Settings → Privacy & Security → Microphone → turn ON for Safari',
           'Come back here, tap Try again, and tap Allow when asked',
         ],
       };
     }
-    if (isAndroid) {
+    if (browser === 'ios-chrome') {
       return {
         title: 'Allow microphone in Chrome',
         intro: 'Chrome needs permission to use your microphone.',
         steps: [
+          'Open iPhone Settings → Chrome → Microphone → ON',
+          'Come back here, tap Try again, and tap Allow when asked',
+        ],
+      };
+    }
+    if (browser === 'ios-other') {
+      return {
+        title: 'Allow microphone',
+        intro: 'Your browser needs permission to use the microphone.',
+        steps: [
+          'Open iPhone Settings → Privacy & Security → Microphone',
+          'Turn ON access for the browser you are using',
+          'Come back here, tap Try again, and tap Allow when asked',
+        ],
+      };
+    }
+    if (browser === 'android-chrome') {
+      return {
+        title: 'Allow microphone',
+        intro: 'Allow microphone access for this site.',
+        steps: [
           'Tap the lock icon next to the website address',
           'Tap Permissions → Microphone → Allow',
-          'If you do not see it: Chrome menu (⋮) → Settings → Site settings → Microphone → allow this site',
           'Tap Try again below',
         ],
       };
     }
+    if (browser === 'desktop-safari') {
+      return {
+        title: 'Allow microphone in Safari',
+        intro: 'Safari needs permission to use your microphone.',
+        steps: [
+          'Safari menu → Settings → Websites → Microphone',
+          'Set this site to Allow',
+          'Reload the page, then tap Try again',
+        ],
+      };
+    }
+    if (browser === 'desktop-chrome') {
+      return {
+        title: 'Allow microphone',
+        intro: 'Chrome needs permission to use your microphone.',
+        steps: [
+          'Click the lock icon in the address bar',
+          'Set Microphone to Allow',
+          'Reload the page, then tap Try again',
+        ],
+      };
+    }
     return {
-      title: 'Allow microphone access',
-      intro: 'Your browser blocked microphone access for this site.',
-      steps: [
-        'Click the lock or tune icon in the address bar',
-        'Set Microphone to Allow',
-        'Reload the page if needed, then tap Try again',
-      ],
+      title: 'Allow microphone',
+      intro: 'Your browser needs permission to use the microphone.',
+      steps: genericMicSteps(),
     };
   }
 
@@ -275,30 +363,14 @@ function getMicHelp(err) {
     return {
       title: 'Microphone not found',
       intro: 'No microphone was detected, or access is still blocked.',
-      steps: isIOS
-        ? [
-            'Check Settings → Chrome → Microphone is ON',
-            'Disconnect Bluetooth headphones if they have no mic',
-            'Close other apps using the microphone',
-            'Reload this page and tap Try again',
-          ]
-        : [
-            'Check that a microphone is connected and not muted',
-            'In Chrome, allow microphone access for this site (lock icon in the address bar)',
-            'On Android: Settings → Apps → Chrome → Permissions → Microphone',
-            'Reload this page and tap Try again',
-          ],
+      steps: genericMicSteps(),
     };
   }
 
   return {
     title: 'Could not access microphone',
     intro: 'Something stopped the microphone from starting.',
-    steps: [
-      'Check microphone permissions for this site in your browser settings',
-      'Close other apps that may be using the microphone',
-      'Reload the page and tap Try again',
-    ],
+    steps: genericMicSteps(),
   };
 }
 
@@ -321,7 +393,6 @@ function bindMicHelp() {
     releaseMic();
     try {
       await ensureMicStream();
-      showToast('Microphone ready — tap to speak');
     } catch (err) {
       showMicHelp(err);
     }
@@ -354,19 +425,6 @@ function checkMicSupport() {
   if (!navigator.mediaDevices?.getUserMedia) {
     mainMicBtn.disabled = true;
     showToast('Microphone not supported');
-  }
-}
-
-async function warmMic() {
-  if (!navigator.mediaDevices?.getUserMedia) return;
-  if (state.mediaStream?.active) return;
-
-  try {
-    state.mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true },
-    });
-  } catch {
-    // Permission will be requested on first tap.
   }
 }
 
@@ -412,12 +470,47 @@ function updateProgressBar(pct) {
   progressTrack.setAttribute('aria-valuenow', String(value));
 }
 
+function stopRecordingProgress() {
+  if (recordingProgressRaf) cancelAnimationFrame(recordingProgressRaf);
+  recordingProgressRaf = null;
+  progressWrap.classList.remove('is-recording');
+}
+
+function startRecordingProgress() {
+  stopRecordingProgress();
+  stopProgress();
+  progressWrap.hidden = false;
+  progressWrap.classList.add('is-recording');
+  progressTrack.setAttribute('aria-label', 'Recording progress');
+  updateProgressBar(0);
+
+  const tick = () => {
+    if (!state.isRecording) return;
+
+    const elapsed = Date.now() - state.recordingStartedAt;
+    updateProgressBar(Math.min((elapsed / MAX_RECORDING_MS) * 100, 100));
+
+    if (elapsed >= MAX_RECORDING_MS) {
+      stopRecordingProgress();
+      showToast('1 minute limit — processing…');
+      void stopRecording();
+      return;
+    }
+
+    recordingProgressRaf = requestAnimationFrame(tick);
+  };
+
+  recordingProgressRaf = requestAnimationFrame(tick);
+}
+
 function startProgress(estimatedMs) {
+  stopRecordingProgress();
   stopProgress();
   progressEstimateMs = estimatedMs;
   progressStartedAt = performance.now();
   progressWrap.hidden = false;
   progressWrap.classList.add('is-active');
+  progressTrack.setAttribute('aria-label', 'Translation progress');
   updateProgressBar(0);
 
   const tick = (now) => {
@@ -446,6 +539,7 @@ function stopProgress() {
   if (progressRaf) cancelAnimationFrame(progressRaf);
   progressRaf = null;
   progressWrap.classList.remove('is-active');
+  progressWrap.classList.remove('is-recording');
 }
 
 async function toggleRecording() {
@@ -476,12 +570,13 @@ async function startRecording() {
       if (e.data.size > 0) state.audioChunks.push(e.data);
     };
 
-    state.mediaRecorder.start();
+    // Timeslice helps mobile browsers flush audio chunks reliably
+    state.mediaRecorder.start(250);
     state.recordingStartedAt = Date.now();
     state.isRecording = true;
     mainMicBtn.classList.add('recording');
-    liveTranscript.hidden = false;
-    liveTranscript.textContent = 'Listening…';
+    liveTranscript.hidden = true;
+    startRecordingProgress();
   } catch (err) {
     showMicHelp(err);
     releaseMic();
@@ -496,13 +591,19 @@ async function stopRecording() {
   mainMicBtn.classList.remove('recording');
   mainMicBtn.classList.add('processing');
   mainMicBtn.disabled = true;
-  liveTranscript.hidden = false;
-  liveTranscript.textContent = 'Translating…';
+  liveTranscript.hidden = true;
+  stopRecordingProgress();
 
   const mimeType = state.mediaRecorder.mimeType || 'audio/webm';
 
   await new Promise((resolve) => {
-    state.mediaRecorder.onstop = resolve;
+    state.mediaRecorder.onstop = () => {
+      // Let the final ondataavailable fire (common mobile quirk)
+      setTimeout(resolve, 120);
+    };
+    if (state.mediaRecorder.state === 'recording' && typeof state.mediaRecorder.requestData === 'function') {
+      state.mediaRecorder.requestData();
+    }
     state.mediaRecorder.stop();
   });
 
@@ -511,13 +612,26 @@ async function stopRecording() {
   const blob = new Blob(state.audioChunks, { type: mimeType });
   state.audioChunks = [];
 
-  if (blob.size < 1000) {
+  const recordingMs = state.recordingStartedAt ? Date.now() - state.recordingStartedAt : 0;
+
+  if (recordingMs < 450 && blob.size < 800) {
     showToast('Recording too short');
     resetMicUI();
     return;
   }
 
-  const recordingMs = state.recordingStartedAt ? Date.now() - state.recordingStartedAt : 0;
+  if (blob.size < 400) {
+    showToast('Could not capture audio — tap and speak again');
+    resetMicUI();
+    return;
+  }
+
+  if (recordingMs > MAX_RECORDING_MS) {
+    showToast('Recording too long — 1 minute max');
+    resetMicUI();
+    return;
+  }
+
   startProgress(estimateProcessingMs(recordingMs, blob.size));
 
   try {
@@ -525,6 +639,7 @@ async function stopRecording() {
     form.append('audio', blob, `audio.${mimeType.includes('mp4') ? 'mp4' : 'webm'}`);
     form.append('lang1', state.lang1);
     form.append('lang2', state.lang2);
+    form.append('durationMs', String(recordingMs));
     form.append('context', JSON.stringify(
       state.messages
         .filter((m) => [state.lang1, state.lang2].includes(m.detectedLanguage))
@@ -557,7 +672,7 @@ async function stopRecording() {
 
     state.messages.push(message);
     renderMessage(message);
-    prefetchAudio(message);
+    prefetchAudio(message).catch(() => {});
     await finishProgress();
   } catch (err) {
     showToast(err.message);
@@ -578,6 +693,8 @@ function releaseMic() {
 
 function resetMicUI() {
   stopProgress();
+  stopRecordingProgress();
+  releaseMic();
   state.isProcessing = false;
   mainMicBtn.classList.remove('processing');
   liveTranscript.hidden = true;
@@ -597,9 +714,13 @@ async function playTranslation(msg, btn) {
   btn.disabled = true;
 
   try {
-    if (!msg.audioUrl) await prefetchAudio(msg);
+    try {
+      await loadMessageAudio(msg);
+    } catch {
+      await loadMessageAudio(msg, { retry: true });
+    }
 
-    if (!msg.audioUrl) throw new Error('Could not load audio');
+    if (!msg.audioUrl) throw new Error('Audio not ready — tap Listen again');
 
     const audio = new Audio(msg.audioUrl);
     state.currentAudio = audio;

@@ -18,6 +18,8 @@ import {
 
 dotenv.config();
 
+const MAX_RECORDING_MS = 60_000;
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -247,6 +249,11 @@ export function createApp() {
     }
     if (!req.file?.buffer?.length) {
       return res.status(400).json({ error: 'No audio received' });
+    }
+
+    const durationMs = parseInt(req.body.durationMs, 10);
+    if (Number.isFinite(durationMs) && durationMs > MAX_RECORDING_MS) {
+      return res.status(400).json({ error: 'Recording too long — 1 minute max' });
     }
 
     const mimeType = req.file.mimetype || 'audio/webm';
