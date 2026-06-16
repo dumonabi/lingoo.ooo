@@ -1,6 +1,6 @@
-# Lingoo.ooo — AI Conversation Translator
+# Lingu.ooo — AI Conversation Translator
 
-Talk with someone who speaks a different language. Lingoo.ooo uses GPT to automatically detect which language was spoken, translate it naturally, and speak the result aloud — no manual prompts needed.
+Talk with someone who speaks a different language. Lingu.ooo uses GPT to automatically detect which language was spoken, translate it naturally, and speak the result aloud — no manual prompts needed.
 
 **Default language pair: English ↔ Spanish** (change anytime — 99 languages supported)
 
@@ -48,7 +48,7 @@ Open **http://localhost:5180** in Chrome or Safari.
 1. Select your two languages at the top (e.g. English + Spanish)
 2. Tap the **big microphone** and speak in **either** language
 3. Tap again when you're done speaking
-4. Lingoo.ooo transcribes, detects the language, improves your message, and translates
+4. Lingu.ooo transcribes, detects the language, improves your message, and translates
 5. Tap **Listen** to hear the translation
 
 ## Production
@@ -58,4 +58,4 @@ npm run build
 npm start
 ```
 
-Live app: **https://lingoo-ooo.vercel.app**
+Live app: **https://lingu-ooo.vercel.app**

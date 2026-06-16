@@ -1,10 +1,10 @@
-# Deploy Lingoo.ooo on Vercel
+# Deploy Lingu.ooo on Vercel
 
 ## Live URL
 
-**https://lingoo-ooo.vercel.app**
+**https://lingu-ooo.vercel.app**
 
-> `lingoo.vercel.app` is already taken on Vercel, so the project uses `lingoo-ooo`.
+> Vercel project: `linguooo` · GitHub repo: `Linguooo`
 
 ---
 

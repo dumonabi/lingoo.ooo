@@ -1,4 +1,4 @@
-const DB_NAME = 'lingoo-pending';
+const DB_NAME = 'lingu-pending';
 const STORE = 'recordings';
 const DB_VERSION = 1;
 const MAX_PENDING = 12;
