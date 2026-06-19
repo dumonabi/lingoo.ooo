@@ -154,10 +154,6 @@ const LATIN_MARKER_PATTERNS = {
   fr: /\b(le|la|les|de|que|et|en|un|une|est|pas|se|pour|avec|dans|sur|très|mais|bien|bonjour|merci|comment|aussi|maintenant|je|tu|il|elle|nous|vous|ils|elles|ce|ça|ici)\b/gi,
 };
 
-const HD_TTS_LANGS = new Set([
-  'th', 'ar', 'he', 'zh', 'ja', 'ko', 'hi', 'ta', 'te', 'bn', 'km', 'lo', 'my', 'pa', 'ur', 'fa', 'ru', 'uk', 'el', 'ka', 'am', 'ne', 'si', 'ml', 'kn', 'gu', 'mr', 'bo',
-]);
-
 function scoreLatinLanguage(text, code) {
   if (!text || !LATIN_MARKER_PATTERNS[code]) return 0;
   const lower = text.toLowerCase();
@@ -250,8 +246,8 @@ async function translateText(openai, text, lang1, lang2, context) {
   const completion = await withRetry(() =>
     openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      temperature: 0.4,
-      max_tokens: 280,
+      temperature: 0.35,
+      max_tokens: 220,
       response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: buildSystemPrompt(lang1, lang2) },
@@ -301,16 +297,15 @@ async function generateSpeech(openai, text, lang) {
     throw new Error('No speakable text');
   }
 
-  const model = lang && HD_TTS_LANGS.has(lang) ? 'tts-1-hd' : 'tts-1';
   const speech = await withRetry(() =>
     openai.audio.speech.create({
-      model,
+      model: 'tts-1',
       voice: 'nova',
       input,
-      speed: lang === 'th' ? 0.98 : 1.05,
+      speed: 1.08,
       response_format: 'mp3',
     }),
-    4
+    2
   );
   return Buffer.from(await speech.arrayBuffer());
 }
@@ -402,7 +397,15 @@ export function createApp() {
         return res.status(500).json({ error: 'Could not translate message' });
       }
 
-      res.json({ rawText, ...translated });
+      let audioBase64 = null;
+      try {
+        const audioBuffer = await generateSpeech(openai, translated.translatedText, translated.targetLanguage);
+        audioBase64 = audioBuffer.toString('base64');
+      } catch (ttsErr) {
+        console.error('Inline TTS error:', ttsErr);
+      }
+
+      res.json({ rawText, ...translated, audioBase64 });
     } catch (err) {
       console.error('Converse error:', err);
       res.status(500).json({ error: formatApiError(err) });

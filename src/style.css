@@ -424,14 +424,6 @@ body {
   padding: 1rem 1.05rem;
 }
 
-.message-empty {
-  margin: 0;
-  padding: 1.35rem 0.75rem;
-  text-align: center;
-  color: var(--text-muted);
-  font-size: 0.92rem;
-}
-
 .message-card {
   display: flex;
   flex-direction: column;

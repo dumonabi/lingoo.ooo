@@ -14,6 +14,7 @@ const STORAGE_KEY = 'lingo-languages';
 const DEFAULT_LANG1 = 'en';
 const DEFAULT_LANG2 = 'es';
 const MAX_RECORDING_MS = 60_000;
+const RECORDING_TAIL_MS = 400;
 
 let authRequired = false;
 
@@ -24,6 +25,7 @@ const state = {
   messages: [],
   isProcessing: false,
   isRecording: false,
+  stoppingRecording: false,
   mediaRecorder: null,
   audioChunks: [],
   mediaStream: null,
@@ -83,6 +85,24 @@ function prefetchAudio(msg) {
 
 function audioCacheKey(msg) {
   return `${msg.translated}|${msg.targetLanguage}`;
+}
+
+function audioUrlFromBase64(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+}
+
+function attachBundledAudio(message, data) {
+  if (!data?.audioBase64) return false;
+  try {
+    message.audioUrl = audioUrlFromBase64(data.audioBase64);
+    message._audioKey = audioCacheKey(message);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function cancelMessageAudio(msg) {
@@ -160,7 +180,7 @@ async function loadMessageAudio(msg, { prefetch = false } = {}) {
     if (msg.audioUrl) return;
   }
 
-  const attempts = prefetch ? 3 : 2;
+  const attempts = prefetch ? 2 : 2;
   const messageId = msg.id;
   const generation = playbackEpoch;
 
@@ -215,7 +235,7 @@ async function loadMessageAudio(msg, { prefetch = false } = {}) {
         lastError = err;
         invalidateMessageAudio(msg);
         if (attempt < attempts) {
-          await new Promise((resolve) => setTimeout(resolve, 450 * attempt));
+          await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
         }
       }
     }
@@ -506,7 +526,7 @@ function saveLanguages() {
 
 function clearConversation() {
   state.messages = [];
-  currentMessageEl.innerHTML = '<p class="message-empty">Your last translation will appear here</p>';
+  currentMessageEl.innerHTML = '';
 }
 
 function onLanguagesChanged() {
@@ -1025,9 +1045,8 @@ async function startRecordingProgress() {
     updateProgressRing(Math.min((elapsed / MAX_RECORDING_MS) * 100, 100));
 
     if (elapsed >= MAX_RECORDING_MS) {
-      stopRecordingProgress();
-      showToast('1 minute limit — processing…');
-      void stopRecording();
+      cancelRecordingProgressRaf();
+      void stopRecording({ autoLimit: true });
       return;
     }
 
@@ -1100,7 +1119,10 @@ function applyTranslationResult(data) {
   state.messages.push(message);
   prepareForNewTranslation(message);
   renderConversation();
-  prefetchAudio(message).catch(() => {});
+
+  if (!attachBundledAudio(message, data)) {
+    prefetchAudio(message).catch(() => {});
+  }
 }
 
 function sleep(ms) {
@@ -1347,7 +1369,7 @@ async function toggleRecording() {
     showToast('Select two languages');
     return;
   }
-  if (state.isProcessing) return;
+  if (state.isProcessing || state.stoppingRecording) return;
 
   if (state.isRecording) {
     await stopRecording();
@@ -1387,72 +1409,84 @@ async function startRecording() {
   }
 }
 
-async function stopRecording() {
+async function stopRecording({ autoLimit = false } = {}) {
   if (!state.mediaRecorder || state.mediaRecorder.state === 'inactive') return;
-
-  state.isRecording = false;
-  state.isProcessing = true;
-  mainMicBtn.classList.remove('recording');
-  mainMicBtn.classList.add('processing');
-  mainMicBtn.setAttribute('aria-label', 'Translating…');
-  mainMicBtn.disabled = true;
-  liveTranscript.hidden = true;
-  stopRecordingProgress();
-
-  const mimeType = state.mediaRecorder.mimeType || 'audio/webm';
-
-  await new Promise((resolve) => {
-    state.mediaRecorder.onstop = () => {
-      // Let the final ondataavailable fire (common mobile quirk)
-      setTimeout(resolve, 120);
-    };
-    if (state.mediaRecorder.state === 'recording' && typeof state.mediaRecorder.requestData === 'function') {
-      state.mediaRecorder.requestData();
-    }
-    state.mediaRecorder.stop();
-  });
-
-  cleanupRecorder();
-
-  const blob = new Blob(state.audioChunks, { type: mimeType });
-  state.audioChunks = [];
-
-  const recordingMs = state.recordingStartedAt ? Date.now() - state.recordingStartedAt : 0;
-
-  if (recordingMs < 450 && blob.size < 800) {
-    showToast('Recording too short');
-    resetMicUI();
-    return;
-  }
-
-  if (blob.size < 400) {
-    showToast('Could not capture audio — tap and speak again');
-    resetMicUI();
-    return;
-  }
-
-  if (recordingMs > MAX_RECORDING_MS) {
-    showToast('Recording too long — 1 minute max');
-    resetMicUI();
-    return;
-  }
-
-  startProgress(estimateProcessingMs(recordingMs, blob.size));
+  if (state.stoppingRecording) return;
+  state.stoppingRecording = true;
 
   try {
-    await sendRecordingForTranslation({ blob, mimeType, recordingMs });
-    await finishProgress();
-    await refreshPendingBanner();
-  } catch (err) {
-    if (err.retryable !== false) {
+    if (!autoLimit) {
+      await sleep(RECORDING_TAIL_MS);
+    }
+
+    if (!state.mediaRecorder || state.mediaRecorder.state === 'inactive') return;
+
+    state.isRecording = false;
+    state.isProcessing = true;
+    mainMicBtn.classList.remove('recording');
+    mainMicBtn.classList.add('processing');
+    mainMicBtn.setAttribute('aria-label', 'Translating…');
+    mainMicBtn.disabled = true;
+    liveTranscript.hidden = true;
+    stopRecordingProgress();
+
+    const mimeType = state.mediaRecorder.mimeType || 'audio/webm';
+
+    await new Promise((resolve) => {
+      state.mediaRecorder.onstop = () => {
+        setTimeout(resolve, 200);
+      };
+      if (state.mediaRecorder.state === 'recording' && typeof state.mediaRecorder.requestData === 'function') {
+        state.mediaRecorder.requestData();
+      }
+      state.mediaRecorder.stop();
+    });
+
+    cleanupRecorder();
+
+    const blob = new Blob(state.audioChunks, { type: mimeType });
+    state.audioChunks = [];
+
+    const recordingMs = Math.min(
+      state.recordingStartedAt ? Date.now() - state.recordingStartedAt : 0,
+      MAX_RECORDING_MS,
+    );
+
+    if (autoLimit) {
+      showToast('1 minute limit — processing…');
+    }
+
+    if (recordingMs < 450 && blob.size < 800) {
+      showToast('Recording too short');
+      resetMicUI();
+      return;
+    }
+
+    if (blob.size < 400) {
+      showToast('Could not capture audio — tap and speak again');
+      resetMicUI();
+      return;
+    }
+
+    startProgress(estimateProcessingMs(recordingMs, blob.size));
+
+    try {
+      await sendRecordingForTranslation({ blob, mimeType, recordingMs });
+      await finishProgress();
       await refreshPendingBanner();
-      showToast(err.message || 'Message saved — will retry automatically');
-      schedulePendingRetry(3000);
-    } else {
-      showToast(err.message);
+    } catch (err) {
+      if (err.retryable !== false) {
+        await refreshPendingBanner();
+        showToast(err.message || 'Message saved — will retry automatically');
+        schedulePendingRetry(3000);
+      } else {
+        showToast(err.message);
+      }
+    } finally {
+      resetMicUI();
     }
   } finally {
-    resetMicUI();
+    state.stoppingRecording = false;
   }
 }
 
@@ -1472,6 +1506,7 @@ function resetMicUI() {
   stopRecordingProgress();
   releaseMic();
   state.isProcessing = false;
+  state.stoppingRecording = false;
   mainMicBtn.classList.remove('processing');
   clearProcessingVisuals();
   liveTranscript.hidden = true;
@@ -1563,7 +1598,7 @@ function renderConversation() {
   currentMessageEl.innerHTML = '';
 
   if (!state.messages.length) {
-    currentMessageEl.innerHTML = '<p class="message-empty">Your last translation will appear here</p>';
+    currentMessageEl.innerHTML = '';
     return;
   }
 
