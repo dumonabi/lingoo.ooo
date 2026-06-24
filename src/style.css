@@ -404,30 +404,14 @@ body {
   min-height: 260px;
 }
 
-.message-panel {
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
-  background: var(--surface);
-}
-
-.message-panel-current {
-  flex-shrink: 0;
-  margin-bottom: 0.5rem;
-  border-color: rgba(34, 197, 94, 0.38);
-  background: linear-gradient(160deg, rgba(34, 197, 94, 0.1) 0%, var(--surface) 55%);
-  box-shadow:
-    0 0 0 1px rgba(34, 197, 94, 0.14),
-    0 10px 32px rgba(34, 197, 94, 0.12);
-}
-
 .message-panel-body {
-  padding: 1rem 1.05rem;
+  width: 100%;
 }
 
 .message-card {
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
+  gap: 0.75rem;
   animation: fadeIn 0.32s ease;
 }
 
@@ -447,65 +431,67 @@ body {
 
 .message-bubble {
   width: 100%;
-  padding: 0.85rem 1.05rem;
+  padding: 1rem 1.1rem;
   border-radius: var(--radius);
-  border: 1px solid rgba(34, 197, 94, 0.2);
-  background: linear-gradient(135deg, var(--surface) 0%, rgba(34, 197, 94, 0.06) 100%);
+  border: 1px solid rgba(34, 197, 94, 0.42);
+  background: linear-gradient(160deg, rgba(34, 197, 94, 0.1) 0%, var(--surface) 55%);
+  box-shadow:
+    0 0 0 1px rgba(34, 197, 94, 0.14),
+    0 10px 32px rgba(34, 197, 94, 0.12);
 }
 
 .message-card-current .message-bubble {
-  border-color: rgba(34, 197, 94, 0.42);
-  background: linear-gradient(135deg, var(--surface) 0%, rgba(34, 197, 94, 0.1) 100%);
-  padding: 1rem 1.1rem;
+  padding: 1.05rem 1.15rem;
 }
 
 .message-original {
   font-size: 0.95rem;
   color: var(--text);
   opacity: 0.92;
+  line-height: 1.45;
 }
 
 .message-translated {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 0.65rem;
   font-size: 1rem;
   font-weight: 600;
-  padding-top: 0.5rem;
-  margin-top: 0.5rem;
+  padding-top: 0.65rem;
+  margin-top: 0.65rem;
   border-top: 1px solid var(--border);
   color: var(--accent-light);
 }
 
 .message-translated-text {
-  flex: 1;
-  min-width: 0;
+  display: block;
+  width: 100%;
   line-height: 1.45;
+  word-break: break-word;
 }
 
 .message-card-current .message-translated {
   font-size: 1.12rem;
 }
 
-.message-inline-actions {
+.message-footer-actions {
   display: flex;
   align-items: center;
-  gap: 0.85rem;
-  flex-shrink: 0;
-  margin-left: 0.15rem;
-}
-
-.message-meta {
-  width: 100%;
+  justify-content: space-between;
+  margin-top: 0.85rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--border);
 }
 
 .message-actions-listen {
   display: flex;
   justify-content: center;
   width: 100%;
-  min-height: 66px;
-  padding-top: 0.35rem;
+}
+
+.message-actions-listen[hidden] {
+  display: none;
+}
+
+.message-actions-listen.is-ready {
+  animation: fadeInUp 0.35s ease;
 }
 
 .message-langs {
@@ -868,9 +854,9 @@ body {
   .logo h1 { font-size: 1.75rem; }
   .chameleon-logo { width: 2.1rem; height: 2.1rem; }
 
-  .message-inline-actions {
-    gap: 1.15rem;
-    margin-left: 0.25rem;
+  .message-footer-actions {
+    margin-top: 0.95rem;
+    padding-top: 0.75rem;
   }
 
   .mic-ring-wrap {

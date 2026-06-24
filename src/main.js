@@ -77,7 +77,6 @@ let micWaveShiftBusy = false;
 const COPY_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>';
 const SHARE_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z"/></svg>';
 const LISTEN_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>';
-const shareSupported = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
 
 function prefetchAudio(msg) {
   return loadMessageAudio(msg, { prefetch: true });
@@ -87,22 +86,27 @@ function audioCacheKey(msg) {
   return `${msg.translated}|${msg.targetLanguage}`;
 }
 
-function audioUrlFromBase64(base64) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+function getMessageCardEl(message) {
+  return document.querySelector(`.message-card[data-message-id="${message.id}"]`);
 }
 
-function attachBundledAudio(message, data) {
-  if (!data?.audioBase64) return false;
-  try {
-    message.audioUrl = audioUrlFromBase64(data.audioBase64);
-    message._audioKey = audioCacheKey(message);
-    return true;
-  } catch {
-    return false;
+function revealListenButton(message) {
+  const listenWrap = getMessageCardEl(message)?.querySelector('.message-actions-listen');
+  if (!listenWrap) return;
+  listenWrap.hidden = false;
+  listenWrap.classList.add('is-ready');
+}
+
+function startBackgroundAudio(message) {
+  if (message.audioUrl) {
+    revealListenButton(message);
+    return;
   }
+
+  void prefetchAudio(message).finally(() => {
+    if (message.id !== state.latestMessageId) return;
+    revealListenButton(message);
+  });
 }
 
 function cancelMessageAudio(msg) {
@@ -182,7 +186,6 @@ async function loadMessageAudio(msg, { prefetch = false } = {}) {
 
   const attempts = prefetch ? 2 : 2;
   const messageId = msg.id;
-  const generation = playbackEpoch;
 
   msg._audioPromise = enqueueSpeak(async () => {
     if (prefetch && state.latestMessageId && messageId !== state.latestMessageId) return;
@@ -252,7 +255,7 @@ async function loadMessageAudio(msg, { prefetch = false } = {}) {
       if (!prefetch) throw err;
     }
   } finally {
-    if (generation !== playbackEpoch && prefetch) {
+    if (prefetch && state.latestMessageId && messageId !== state.latestMessageId) {
       cancelMessageAudio(msg);
     }
   }
@@ -358,16 +361,21 @@ function releaseActionButtonFocus(btn) {
 }
 
 async function shareTranslation(text, btn) {
-  if (!shareSupported) {
-    showToast('Share not available on this device');
-    return;
-  }
-
   try {
-    await navigator.share({ text });
+    if (typeof navigator.share === 'function') {
+      await navigator.share({ text });
+      return;
+    }
+    await navigator.clipboard.writeText(text);
+    showToast('Copied — paste to share');
   } catch (err) {
     if (err?.name === 'AbortError') return;
-    showToast('Could not share');
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast('Copied — paste to share');
+    } catch {
+      showToast('Could not share');
+    }
   } finally {
     releaseActionButtonFocus(btn);
   }
@@ -391,7 +399,7 @@ async function init() {
   checkMicSupport();
   updateMicState();
   void refreshPendingBanner();
-  schedulePendingRetry(1500);
+  wakePendingQueue();
 }
 
 async function ensureAuthenticated() {
@@ -723,12 +731,11 @@ function getMimeType() {
 }
 
 function estimateProcessingMs(recordingMs, blobBytes) {
-  const MIN_MS = 3000;
-  const MAX_MS = 6500;
+  const MIN_MS = 2000;
+  const MAX_MS = 4500;
 
   const audioSeconds = Math.max(recordingMs / 1000, blobBytes / 11000, 0.5);
 
-  // Real waits cluster around 3–6s; longer clips add a little, not linearly
   const t = Math.min(audioSeconds / 10, 1);
   return Math.round(MIN_MS + t * (MAX_MS - MIN_MS));
 }
@@ -1119,10 +1126,7 @@ function applyTranslationResult(data) {
   state.messages.push(message);
   prepareForNewTranslation(message);
   renderConversation();
-
-  if (!attachBundledAudio(message, data)) {
-    prefetchAudio(message).catch(() => {});
-  }
+  startBackgroundAudio(message);
 }
 
 function sleep(ms) {
@@ -1165,8 +1169,14 @@ async function fetchConverse(form, { attempts = 3 } = {}) {
   throw error;
 }
 
+function clampRecordingMs(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return 0;
+  return Math.min(ms, MAX_RECORDING_MS);
+}
+
 async function submitRecording({ blob, mimeType, recordingMs, lang1, lang2, context, pendingId }) {
   const id = pendingId || crypto.randomUUID();
+  const safeRecordingMs = clampRecordingMs(recordingMs);
 
   if (!pendingId) {
     await savePendingRecording({
@@ -1176,7 +1186,7 @@ async function submitRecording({ blob, mimeType, recordingMs, lang1, lang2, cont
       lang1,
       lang2,
       contextJson: JSON.stringify(context),
-      recordingMs,
+      recordingMs: safeRecordingMs,
       createdAt: Date.now(),
     });
   }
@@ -1185,7 +1195,7 @@ async function submitRecording({ blob, mimeType, recordingMs, lang1, lang2, cont
   form.append('audio', blob, `audio.${mimeType.includes('mp4') ? 'mp4' : 'webm'}`);
   form.append('lang1', lang1);
   form.append('lang2', lang2);
-  form.append('durationMs', String(recordingMs));
+  form.append('durationMs', String(safeRecordingMs));
   form.append('context', JSON.stringify(context));
 
   let res;
@@ -1231,6 +1241,8 @@ async function submitRecording({ blob, mimeType, recordingMs, lang1, lang2, cont
     error.retryable = isRetryableSendError(error, res);
     if (error.retryable) {
       await updatePendingRecording(id, { lastError: error.message });
+    } else {
+      await removePendingRecording(id);
     }
     throw error;
   }
@@ -1246,17 +1258,7 @@ async function submitRecording({ blob, mimeType, recordingMs, lang1, lang2, cont
 }
 
 async function refreshPendingBanner() {
-  const items = await listPendingRecordings();
-  const banner = $('#pending-banner');
-  if (!items.length) {
-    banner.hidden = true;
-    return;
-  }
-
-  $('#pending-text').textContent = items.length === 1
-    ? '1 message saved on this device. We will retry automatically when the connection is back.'
-    : `${items.length} messages saved on this device. We will retry automatically when the connection is back.`;
-  banner.hidden = false;
+  $('#pending-banner').hidden = true;
 }
 
 function schedulePendingRetry(delayMs = 5000) {
@@ -1267,7 +1269,6 @@ function schedulePendingRetry(delayMs = 5000) {
 }
 
 function wakePendingQueue() {
-  void refreshPendingBanner();
   schedulePendingRetry(400);
 }
 
@@ -1319,12 +1320,10 @@ async function processPendingQueue() {
           attempts: (item.attempts || 0) + 1,
           lastError: err.message || 'Retry later',
         });
-        showToast(err.message || 'Message saved — will retry');
         schedulePendingRetry(retryDelayMs((item.attempts || 0) + 1));
         break;
       }
       await removePendingRecording(item.id);
-      showToast(err.message);
     } finally {
       state.isProcessing = false;
       resetMicUI();
@@ -1336,12 +1335,6 @@ async function processPendingQueue() {
 }
 
 function bindPendingQueue() {
-  $('#pending-retry').addEventListener('click', () => {
-    void processPendingQueue();
-  });
-  $('#pending-dismiss').addEventListener('click', () => {
-    $('#pending-banner').hidden = true;
-  });
   window.addEventListener('online', wakePendingQueue);
   window.addEventListener('focus', wakePendingQueue);
   document.addEventListener('visibilitychange', () => {
@@ -1419,7 +1412,11 @@ async function stopRecording({ autoLimit = false } = {}) {
       await sleep(RECORDING_TAIL_MS);
     }
 
-    if (!state.mediaRecorder || state.mediaRecorder.state === 'inactive') return;
+    if (!state.mediaRecorder || state.mediaRecorder.state === 'inactive') {
+      state.isRecording = false;
+      resetMicUI();
+      return;
+    }
 
     state.isRecording = false;
     state.isProcessing = true;
@@ -1447,16 +1444,12 @@ async function stopRecording({ autoLimit = false } = {}) {
     const blob = new Blob(state.audioChunks, { type: mimeType });
     state.audioChunks = [];
 
-    const recordingMs = Math.min(
-      state.recordingStartedAt ? Date.now() - state.recordingStartedAt : 0,
-      MAX_RECORDING_MS,
-    );
+    const elapsedMs = state.recordingStartedAt ? Date.now() - state.recordingStartedAt : 0;
+    const recordingMs = autoLimit
+      ? MAX_RECORDING_MS
+      : clampRecordingMs(elapsedMs);
 
-    if (autoLimit) {
-      showToast('1 minute limit — processing…');
-    }
-
-    if (recordingMs < 450 && blob.size < 800) {
+    if (!autoLimit && recordingMs < 450 && blob.size < 800) {
       showToast('Recording too short');
       resetMicUI();
       return;
@@ -1473,14 +1466,9 @@ async function stopRecording({ autoLimit = false } = {}) {
     try {
       await sendRecordingForTranslation({ blob, mimeType, recordingMs });
       await finishProgress();
-      await refreshPendingBanner();
     } catch (err) {
       if (err.retryable !== false) {
-        await refreshPendingBanner();
-        showToast(err.message || 'Message saved — will retry automatically');
         schedulePendingRetry(3000);
-      } else {
-        showToast(err.message);
       }
     } finally {
       resetMicUI();
@@ -1494,17 +1482,21 @@ function cleanupRecorder() {
   state.mediaRecorder = null;
 }
 
-function releaseMic() {
-  stopPlayback();
+function releaseMicTracks() {
   state.mediaStream?.getTracks().forEach((t) => t.stop());
   state.mediaStream = null;
   state.mediaRecorder = null;
 }
 
+function releaseMic() {
+  stopPlayback();
+  releaseMicTracks();
+}
+
 function resetMicUI() {
   stopProgress();
   stopRecordingProgress();
-  releaseMic();
+  releaseMicTracks();
   state.isProcessing = false;
   state.stoppingRecording = false;
   mainMicBtn.classList.remove('processing');
@@ -1551,25 +1543,26 @@ function createMessageCard(msg) {
       <div class="message-original">${escapeHtml(msg.original)}</div>
       <div class="message-translated">
         <span class="message-translated-text">${escapeHtml(msg.translated)}</span>
-        <div class="message-inline-actions">
-          <button type="button" class="icon-btn copy-btn copy-btn-inline" title="Copy" aria-label="Copy">
-            ${COPY_BTN_SVG}
-          </button>
-          ${shareSupported ? `
-          <button type="button" class="icon-btn share-btn share-btn-inline" title="Share" aria-label="Share">
-            ${SHARE_BTN_SVG}
-          </button>` : ''}
-        </div>
       </div>
-    </div>
-    <div class="message-meta">
-      <div class="message-actions-listen">
-        <button type="button" class="icon-btn listen-btn" title="Listen" aria-label="Listen">
-          ${LISTEN_BTN_SVG}
+      <div class="message-footer-actions">
+        <button type="button" class="icon-btn share-btn share-btn-inline" title="Share" aria-label="Share">
+          ${SHARE_BTN_SVG}
+        </button>
+        <button type="button" class="icon-btn copy-btn copy-btn-inline" title="Copy" aria-label="Copy">
+          ${COPY_BTN_SVG}
         </button>
       </div>
     </div>
+    <div class="message-actions-listen"${msg.audioUrl ? '' : ' hidden'}>
+      <button type="button" class="icon-btn listen-btn" title="Listen" aria-label="Listen">
+        ${LISTEN_BTN_SVG}
+      </button>
+    </div>
   `;
+
+  if (msg.audioUrl) {
+    el.querySelector('.message-actions-listen')?.classList.add('is-ready');
+  }
 
   const listenBtn = el.querySelector('.listen-btn');
   const copyBtn = el.querySelector('.copy-btn');
@@ -1587,9 +1580,7 @@ function createMessageCard(msg) {
   });
 
   const shareBtn = el.querySelector('.share-btn');
-  if (shareBtn) {
-    shareBtn.addEventListener('click', () => shareTranslation(msg.translated, shareBtn));
-  }
+  shareBtn.addEventListener('click', () => shareTranslation(msg.translated, shareBtn));
 
   return el;
 }

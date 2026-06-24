@@ -18,8 +18,6 @@ import {
 
 dotenv.config();
 
-const MAX_RECORDING_MS = 60_000;
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -43,26 +41,11 @@ function buildSystemPrompt(lang1, lang2) {
   const name1 = LANGUAGE_NAMES[lang1] || lang1;
   const name2 = LANGUAGE_NAMES[lang2] || lang2;
 
-  return `You help two people have a casual real-time conversation between ${name1} (${lang1}) and ${name2} (${lang2}).
+  return `Translate casual chat between ${name1} (${lang1}) and ${name2} (${lang2}) only.
 
-For every message:
-1. Detect which language it is in (${lang1} or ${lang2}) — the speaker never tells you.
-2. sourceText: rewrite what they said in the SAME language — natural, simple, casual, like real speech. Gently fix grammar, spelling, and awkward phrasing. Keep the meaning and friendly tone. Use conversation context when provided.
-3. translatedText: translate to the OTHER language — equally natural, simple, and casual. Not formal, not robotic, not word-for-word stiff. How people actually talk. Use only the target language — no English words mixed into Spanish (or vice versa) unless they are universal loanwords like "OK".
-4. Stay coherent with recent messages (names, pronouns, references).
-5. Do NOT end sourceText or translatedText with a period or dot — these are chat messages meant to be copied and sent as-is.
+Detect ${lang1} or ${lang2}. sourceText: light cleanup in the original language. translatedText: natural translation in the other language — stay close to the meaning. No trailing period.
 
-IMPORTANT: The ONLY languages in this conversation are ${name1} (${lang1}) and ${name2} (${lang2}). Never translate into English or any other language unless it is exactly ${lang1} or ${lang2}. When targetLanguage is "${lang2}", translatedText must be in ${name2}; when targetLanguage is "${lang1}", translatedText must be in ${name1}.
-
-IMPORTANT: detectedLanguage and targetLanguage must be exactly "${lang1}" or "${lang2}" (lowercase codes only).
-
-Respond with JSON only:
-{
-  "detectedLanguage": "${lang1}" or "${lang2}",
-  "sourceText": "improved casual version in original language",
-  "translatedText": "natural casual translation",
-  "targetLanguage": "${lang1}" or "${lang2}"
-}`;
+JSON only: {"detectedLanguage":"${lang1}|${lang2}","sourceText":"...","translatedText":"...","targetLanguage":"${lang1}|${lang2}"}`;
 }
 
 function normalizeLangCode(value, lang1, lang2) {
@@ -230,9 +213,6 @@ function inferDetectedFromText(text, lang1, lang2) {
 }
 
 async function translateText(openai, text, lang1, lang2, context) {
-  const name1 = LANGUAGE_NAMES[lang1] || lang1;
-  const name2 = LANGUAGE_NAMES[lang2] || lang2;
-
   const recentContext = context
     .filter((m) => [lang1, lang2].includes(m.detectedLanguage))
     .slice(-2)
@@ -240,14 +220,14 @@ async function translateText(openai, text, lang1, lang2, context) {
     .join('\n');
 
   const userMessage = recentContext
-    ? `Language pair: ${name1} (${lang1}) ↔ ${name2} (${lang2}) only.\n\nRecent conversation:\n${recentContext}\n\nNew message:\n${text.trim()}`
-    : `Language pair: ${name1} (${lang1}) ↔ ${name2} (${lang2}) only.\n\nNew message:\n${text.trim()}`;
+    ? `${recentContext}\n\n${text.trim()}`
+    : text.trim();
 
   const completion = await withRetry(() =>
     openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      temperature: 0.35,
-      max_tokens: 220,
+      temperature: 0.25,
+      max_tokens: 180,
       response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: buildSystemPrompt(lang1, lang2) },
@@ -374,11 +354,6 @@ export function createApp() {
       return res.status(400).json({ error: 'No audio received' });
     }
 
-    const durationMs = parseInt(req.body.durationMs, 10);
-    if (Number.isFinite(durationMs) && durationMs > MAX_RECORDING_MS) {
-      return res.status(400).json({ error: 'Recording too long — 1 minute max' });
-    }
-
     const mimeType = req.file.mimetype || 'audio/webm';
     const ext = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('ogg') ? 'ogg' : 'webm';
 
@@ -397,15 +372,7 @@ export function createApp() {
         return res.status(500).json({ error: 'Could not translate message' });
       }
 
-      let audioBase64 = null;
-      try {
-        const audioBuffer = await generateSpeech(openai, translated.translatedText, translated.targetLanguage);
-        audioBase64 = audioBuffer.toString('base64');
-      } catch (ttsErr) {
-        console.error('Inline TTS error:', ttsErr);
-      }
-
-      res.json({ rawText, ...translated, audioBase64 });
+      res.json({ rawText, ...translated });
     } catch (err) {
       console.error('Converse error:', err);
       res.status(500).json({ error: formatApiError(err) });
