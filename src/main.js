@@ -2,8 +2,10 @@ import { createLangPicker } from './lang-picker.js';
 import { CHAMELEON_LOGO_SVG } from './chameleon-logo.js';
 import { apiFetch, clearAuthToken, getAuthToken, setAuthToken } from './auth.js';
 import {
+  clearAllPendingRecordings,
   isRetryableSendError,
   listPendingRecordings,
+  purgeStalePendingRecordings,
   removePendingRecording,
   retryDelayMs,
   savePendingRecording,
@@ -36,6 +38,7 @@ const state = {
 
 let playbackEpoch = 0;
 let speakChain = Promise.resolve();
+let latestTranslationRequest = 0;
 
 let picker1;
 let picker2;
@@ -398,6 +401,7 @@ async function init() {
   bindPendingQueue();
   checkMicSupport();
   updateMicState();
+  void purgeStalePendingRecordings();
   void refreshPendingBanner();
   wakePendingQueue();
 }
@@ -1123,10 +1127,11 @@ function applyTranslationResult(data) {
     audioUrl: null,
   };
 
-  state.messages.push(message);
+  state.messages = [message];
   prepareForNewTranslation(message);
   renderConversation();
   startBackgroundAudio(message);
+  void clearAllPendingRecordings();
 }
 
 function sleep(ms) {
@@ -1290,52 +1295,52 @@ async function processPendingQueue() {
   }
 
   pendingQueueBusy = true;
-  const sorted = items.sort((a, b) => a.createdAt - b.createdAt);
+  const item = items.sort((a, b) => b.createdAt - a.createdAt)[0];
+  const requestId = latestTranslationRequest;
 
-  for (const item of sorted) {
-    if (state.isRecording) break;
+  try {
+    if (state.isRecording) return;
 
-    try {
-      state.isProcessing = true;
-      mainMicBtn.classList.add('processing');
-      mainMicBtn.setAttribute('aria-label', 'Translating…');
-      mainMicBtn.disabled = true;
-      startProgress(estimateProcessingMs(item.recordingMs, item.blob?.size || 0));
+    state.isProcessing = true;
+    mainMicBtn.classList.add('processing');
+    mainMicBtn.setAttribute('aria-label', 'Translating…');
+    mainMicBtn.disabled = true;
+    startProgress(estimateProcessingMs(item.recordingMs, item.blob?.size || 0));
 
-      const context = JSON.parse(item.contextJson || '[]');
-      const data = await submitRecording({
-        blob: item.blob,
-        mimeType: item.mimeType,
-        recordingMs: item.recordingMs,
-        lang1: item.lang1,
-        lang2: item.lang2,
-        context,
-        pendingId: item.id,
-      });
+    const context = JSON.parse(item.contextJson || '[]');
+    const data = await submitRecording({
+      blob: item.blob,
+      mimeType: item.mimeType,
+      recordingMs: item.recordingMs,
+      lang1: item.lang1,
+      lang2: item.lang2,
+      context,
+      pendingId: item.id,
+    });
 
-      applyTranslationResult(data);
-      await finishProgress();
-    } catch (err) {
-      if (err.retryable !== false) {
-        if (err.message?.includes('Session expired') && authRequired) {
-          showAuthGate();
-        }
-        await updatePendingRecording(item.id, {
-          attempts: (item.attempts || 0) + 1,
-          lastError: err.message || 'Retry later',
-        });
-        schedulePendingRetry(retryDelayMs((item.attempts || 0) + 1));
-        break;
+    if (requestId !== latestTranslationRequest) return;
+
+    applyTranslationResult(data);
+    await finishProgress();
+  } catch (err) {
+    if (err.retryable !== false) {
+      if (err.message?.includes('Session expired') && authRequired) {
+        showAuthGate();
       }
+      await updatePendingRecording(item.id, {
+        attempts: (item.attempts || 0) + 1,
+        lastError: err.message || 'Retry later',
+      });
+      schedulePendingRetry(retryDelayMs((item.attempts || 0) + 1));
+    } else {
       await removePendingRecording(item.id);
-    } finally {
-      state.isProcessing = false;
-      resetMicUI();
     }
+  } finally {
+    state.isProcessing = false;
+    resetMicUI();
+    pendingQueueBusy = false;
+    await refreshPendingBanner();
   }
-
-  pendingQueueBusy = false;
-  await refreshPendingBanner();
 }
 
 function bindPendingQueue() {
@@ -1350,6 +1355,7 @@ function bindPendingQueue() {
 }
 
 async function sendRecordingForTranslation({ blob, mimeType, recordingMs }) {
+  const requestId = ++latestTranslationRequest;
   const data = await submitRecording({
     blob,
     mimeType,
@@ -1358,6 +1364,7 @@ async function sendRecordingForTranslation({ blob, mimeType, recordingMs }) {
     lang2: state.lang2,
     context: buildConversationContext(),
   });
+  if (requestId !== latestTranslationRequest) return;
   applyTranslationResult(data);
 }
 
@@ -1377,6 +1384,7 @@ async function toggleRecording() {
 }
 
 async function startRecording() {
+  latestTranslationRequest++;
   stopPlayback();
   try {
     await ensureMicStream();

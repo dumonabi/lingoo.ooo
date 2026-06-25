@@ -80,6 +80,19 @@ export async function removePendingRecording(id) {
   }
 }
 
+export async function clearAllPendingRecordings() {
+  const items = await listPendingRecordings();
+  await Promise.all(items.map((item) => removePendingRecording(item.id)));
+}
+
+export async function purgeStalePendingRecordings(maxAgeMs = 60 * 60 * 1000) {
+  const cutoff = Date.now() - maxAgeMs;
+  const items = await listPendingRecordings();
+  await Promise.all(
+    items.filter((item) => (item.createdAt || 0) < cutoff).map((item) => removePendingRecording(item.id)),
+  );
+}
+
 export async function listPendingRecordings() {
   const merged = new Map(memoryFallback);
 
