@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#0a1412" />
+    <meta name="theme-color" content="#050907" />
     <meta name="description" content="Lingu.ooo — speak in either language, AI translates automatically" />
     <title>Lingu.ooo</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -25,30 +25,96 @@
         <div id="lang-picker-2" class="lang-picker-slot"></div>
       </section>
 
-      <div class="mic-area">
-        <div class="live-transcript" id="live-transcript" hidden></div>
-        <div class="mic-ring-wrap" id="mic-ring-wrap">
-          <svg
-            class="mic-progress-ring"
-            id="progress-ring"
-            viewBox="0 0 120 120"
-            role="progressbar"
-            aria-valuemin="0"
-            aria-valuemax="100"
-            aria-valuenow="0"
-            aria-label="Progress"
-          >
-            <circle class="mic-progress-bg" cx="60" cy="60" r="54" />
-            <circle class="mic-progress-fill" id="progress-ring-fill" cx="60" cy="60" r="54" />
-          </svg>
-          <button type="button" class="main-mic-btn" id="main-mic" aria-label="Tap to speak">
-            <span class="mic-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.2 14.47 16 12 16s-4.52-1.8-4.93-4.15c-.08-.49-.49-.85-.98-.85-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V20c0 .55.45 1 1 1s1-.45 1-1v-2.03c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/></svg>
-            </span>
-            <span class="mic-waveform" id="mic-waveform" aria-hidden="true"></span>
-          </button>
+      <section class="compose-box" id="compose-box">
+        <div class="compose-input-wrap" id="compose-input-wrap">
+          <textarea
+            id="dictation-input"
+            class="compose-input"
+            rows="1"
+            spellcheck="true"
+            aria-label="Message to translate"
+          ></textarea>
+          <span class="compose-caret" id="compose-caret" aria-hidden="true"></span>
         </div>
-      </div>
+        <div class="compose-footer">
+          <div class="compose-toolbar">
+            <div class="compose-toolbar-left">
+              <div class="compose-idle" id="compose-idle">
+                <button
+                  type="button"
+                  class="compose-mic-btn"
+                  id="compose-mic"
+                  aria-label="Record message"
+                  title="Record message"
+                >
+                  <svg class="compose-mic-progress" viewBox="0 0 44 44" aria-hidden="true">
+                    <circle class="compose-mic-progress-track" cx="22" cy="22" r="19" />
+                    <circle class="compose-mic-progress-fill" id="compose-mic-progress-fill" cx="22" cy="22" r="19" />
+                  </svg>
+                  <svg class="compose-mic-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.2 14.47 16 12 16s-4.52-1.8-4.93-4.15c-.08-.49-.49-.85-.98-.85-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V20c0 .55.45 1 1 1s1-.45 1-1v-2.03c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/>
+                  </svg>
+                </button>
+              </div>
+              <div class="compose-recording" id="compose-recording">
+                <div class="compose-level" id="compose-level" aria-hidden="true"></div>
+                <button
+                  type="button"
+                  class="compose-recording-cancel"
+                  id="recording-cancel"
+                  aria-label="Cancel recording"
+                  title="Cancel"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true">
+                    <path d="M18 6L6 18M6 6l12 12" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  class="compose-recording-send"
+                  id="recording-send"
+                  aria-label="Send recording"
+                  title="Send"
+                >
+                  <svg class="compose-recording-send-progress" viewBox="0 0 44 44" aria-hidden="true">
+                    <circle class="compose-recording-send-progress-track" cx="22" cy="22" r="19" />
+                    <circle class="compose-recording-send-progress-fill" id="recording-send-progress-fill" cx="22" cy="22" r="19" />
+                  </svg>
+                  <svg class="compose-recording-send-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M5 13l4 4L19 7" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <button
+              type="button"
+              class="compose-translate-below"
+              id="dictation-translate"
+              aria-label="Translate"
+              title="Translate"
+              disabled
+            >
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75l1.13 3h2l-4.37-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z" />
+              </svg>
+            </button>
+            <div class="compose-toolbar-right">
+              <button
+                type="button"
+                class="compose-new-btn"
+                id="compose-new"
+                aria-label="New message"
+                title="New message"
+                disabled
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                  <path d="M3 6h18M8 6V4h8v2M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6M10 11v6M14 11v6" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
 
       <section class="conversation-layout" aria-label="Conversation">
         <div class="message-panel-body" id="current-message"></div>

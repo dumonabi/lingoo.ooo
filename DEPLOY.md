@@ -33,6 +33,25 @@ Vercel redeploys automatically on every push to `main`.
 
 ---
 
+## Keep-warm (cold start)
+
+Vercel serverless functions can take 1–3 s on the first request after idle.
+
+| Mechanism | Interval | Notes |
+|-----------|----------|--------|
+| **GitHub Actions** (`.github/workflows/keep-warm.yml`) | Every 10 min | Pings `/api/health` on production URLs after push to `main` |
+| **Client** (`src/keep-warm.js`) | Every 8 min | While the tab is visible on production (not localhost) |
+
+Vercel **Hobby** only allows built-in cron once per day. For 5–10 min intervals, use the GitHub workflow above (free on public repos).
+
+**Pro plan:** you can also add native cron in `vercel.json`:
+
+```json
+"crons": [{ "path": "/api/health", "schedule": "*/10 * * * *" }]
+```
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |

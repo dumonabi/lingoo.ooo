@@ -1,23 +1,6 @@
-import { formatFlagSvg, getFlagSvg } from './flag-svgs.js';
+const MIN_QUERY_LENGTH = 2;
 
-const GLOBE_FALLBACK_SVG = `<svg class="flag-svg flag-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.8 3.1 2.8 14.9 0 18M12 3c-2.8 3.1-2.8 14.9 0 18"/></svg>`;
-
-export function renderFlag(lang, className = 'flag-icon') {
-  if (!lang) {
-    return `<span class="flag-frame ${className}">${GLOBE_FALLBACK_SVG}</span>`;
-  }
-
-  const svg = getFlagSvg(lang.flagCode);
-  if (svg) {
-    return `<span class="flag-frame ${className}">${formatFlagSvg(svg)}</span>`;
-  }
-
-  return `<span class="flag-frame ${className}">${GLOBE_FALLBACK_SVG}</span>`;
-}
-
-export function createLangPicker(container, { languages, value, onChange, placeholder }) {
-  let isOpen = false;
-  let query = '';
+export function createLangPicker(container, { languages, value, onChange, placeholder = 'Language' }) {
   let selectedCode = value || '';
 
   const root = document.createElement('div');
@@ -26,20 +9,18 @@ export function createLangPicker(container, { languages, value, onChange, placeh
   const inputWrap = document.createElement('div');
   inputWrap.className = 'lang-picker-input-wrap';
 
-  const flagSlot = document.createElement('span');
-  flagSlot.className = 'lang-picker-flag';
-
   const input = document.createElement('input');
   input.type = 'text';
   input.className = 'lang-picker-input';
   input.autocomplete = 'off';
   input.spellcheck = false;
+  input.placeholder = placeholder;
 
   const list = document.createElement('ul');
   list.className = 'lang-picker-list';
   list.hidden = true;
 
-  inputWrap.append(flagSlot, input);
+  inputWrap.append(input);
   root.append(inputWrap, list);
   container.appendChild(root);
 
@@ -47,21 +28,10 @@ export function createLangPicker(container, { languages, value, onChange, placeh
     return languages.find((l) => l.code === code);
   }
 
-  function updateInputDisplay() {
-    const lang = findLang(selectedCode);
-    flagSlot.innerHTML = lang ? renderFlag(lang) : renderFlag(null);
-    if (!isOpen) {
-      input.value = lang ? lang.name : '';
-      input.placeholder = lang ? '' : placeholder;
-    }
-  }
-
   function filteredLanguages() {
-    const q = query.trim().toLowerCase();
-    if (!q) return languages;
-    return languages.filter(
-      (l) => l.name.toLowerCase().includes(q) || l.code.toLowerCase().includes(q)
-    );
+    const q = input.value.trim().toLowerCase();
+    if (q.length < MIN_QUERY_LENGTH) return [];
+    return languages.filter((l) => l.name.toLowerCase().startsWith(q));
   }
 
   function renderList() {
@@ -70,59 +40,46 @@ export function createLangPicker(container, { languages, value, onChange, placeh
       .map(
         (l) => `
       <li class="lang-picker-option${l.code === selectedCode ? ' selected' : ''}" data-code="${l.code}" role="option">
-        <span class="lang-picker-option-flag">${renderFlag(l)}</span>
         <span class="lang-picker-name">${l.name}</span>
-      </li>`
+      </li>`,
       )
       .join('');
-
-    list.hidden = items.length === 0 && !query;
+    list.hidden = items.length === 0;
   }
 
-  function setOpenState(open) {
-    isOpen = open;
-    root.classList.toggle('is-open', open);
-  }
-
-  function open() {
-    setOpenState(true);
-    query = '';
-    input.value = '';
-    input.placeholder = 'Search language…';
-    list.hidden = false;
-    renderList();
-  }
-
-  function close() {
-    setOpenState(false);
-    query = '';
+  function showSelectedDisplay() {
+    const lang = findLang(selectedCode);
+    input.value = lang ? lang.name : '';
+    input.placeholder = lang ? '' : placeholder;
     list.hidden = true;
-    updateInputDisplay();
   }
 
   function select(code) {
-    if (!code || code === selectedCode) {
-      close();
-      return;
+    if (!code) return;
+    if (code !== selectedCode) {
+      selectedCode = code;
+      onChange(code);
     }
-    selectedCode = code;
-    close();
-    onChange(code);
+    showSelectedDisplay();
+    input.blur();
   }
 
-  input.addEventListener('focus', open);
+  input.addEventListener('focus', () => {
+    const lang = findLang(selectedCode);
+    if (lang && input.value === lang.name) {
+      input.select();
+    }
+    renderList();
+  });
 
   input.addEventListener('input', () => {
-    query = input.value;
-    if (!isOpen) setOpenState(true);
-    list.hidden = false;
     renderList();
   });
 
   input.addEventListener('keydown', (e) => {
     const options = [...list.querySelectorAll('.lang-picker-option')];
     if (e.key === 'Escape') {
-      close();
+      showSelectedDisplay();
       input.blur();
     } else if (e.key === 'Enter' && options.length) {
       e.preventDefault();
@@ -133,21 +90,29 @@ export function createLangPicker(container, { languages, value, onChange, placeh
     }
   });
 
+  input.addEventListener('blur', () => {
+    window.setTimeout(() => {
+      if (!root.contains(document.activeElement)) {
+        showSelectedDisplay();
+      }
+    }, 120);
+  });
+
+  list.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+  });
+
   list.addEventListener('click', (e) => {
     const opt = e.target.closest('.lang-picker-option');
     if (opt) select(opt.dataset.code);
   });
 
-  document.addEventListener('click', (e) => {
-    if (!root.contains(e.target)) close();
-  });
-
   function setValue(code) {
     selectedCode = code || '';
-    updateInputDisplay();
+    showSelectedDisplay();
   }
 
-  updateInputDisplay();
+  showSelectedDisplay();
 
   return { setValue, getValue: () => selectedCode };
 }

@@ -11,14 +11,17 @@ import {
   savePendingRecording,
   updatePendingRecording,
 } from './pending-audio.js';
+import { bindKeepWarm } from './keep-warm.js';
 
 const STORAGE_KEY = 'lingo-languages';
 const DEFAULT_LANG1 = 'en';
 const DEFAULT_LANG2 = 'es';
 const MAX_RECORDING_MS = 90_000;
-const RECORDING_TAIL_MS = 400;
+const RECORDING_TAIL_MS = 150;
+const RECORDER_STOP_FLUSH_MS = 150;
 
 let authRequired = false;
+let recordingSessionId = 0;
 
 const state = {
   languages: [],
@@ -34,41 +37,83 @@ const state = {
   currentAudio: null,
   recordingStartedAt: 0,
   latestMessageId: null,
+  draftText: '',
+  composerSession: false,
 };
 
 let playbackEpoch = 0;
 let speakChain = Promise.resolve();
 let latestTranslationRequest = 0;
+let lastTranslationAppliedAt = 0;
+let pendingQueuePausedUntil = 0;
+let activeConverseController = null;
+let draftTranslationPrefetch = null;
+let draftPrefetchSeq = 0;
 
 let picker1;
 let picker2;
 
 const $ = (sel) => document.querySelector(sel);
 
+const appEl = $('#app');
+const languageBarEl = document.querySelector('.language-bar');
 const currentMessageEl = $('#current-message');
 const toastEl = $('#toast');
-const mainMicBtn = $('#main-mic');
-const liveTranscript = $('#live-transcript');
-const micRingWrap = $('#mic-ring-wrap');
-const micWaveformEl = $('#mic-waveform');
-const progressRing = $('#progress-ring');
-const progressRingFill = $('#progress-ring-fill');
+const composeBoxEl = $('#compose-box');
+const composeMicBtn = $('#compose-mic');
+const composeMicProgressFill = $('#compose-mic-progress-fill');
+const composeNewBtn = $('#compose-new');
+const composeRecordingEl = $('#compose-recording');
+const composeLevelEl = $('#compose-level');
+const recordingCancelBtn = $('#recording-cancel');
+const recordingSendBtn = $('#recording-send');
+const recordingSendProgressFill = $('#recording-send-progress-fill');
+const dictationInputEl = $('#dictation-input');
+const composeInputWrapEl = $('#compose-input-wrap');
+const composeCaretEl = $('#compose-caret');
+const dictationTranslateBtn = $('#dictation-translate');
+
+const LOADING_BRAND_TEXT = 'lingu.ooo';
+const LOADING_LETTER_MS = 100;
+const LOADING_DOT_MS = 500;
+const LOADING_DOT_MAX = 20;
+let loadingLetterTimer = null;
+let loadingDotsTimer = null;
+
+let composeCaretMirrorEl = null;
 
 const RING_CIRCUMFERENCE = 2 * Math.PI * 54;
+const COMPOSE_MIC_RING_R = 19;
+const COMPOSE_MIC_RING_CIRCUMFERENCE = 2 * Math.PI * COMPOSE_MIC_RING_R;
 const MIC_WAVE_VISIBLE = 14;
 const MIC_WAVE_TOTAL = MIC_WAVE_VISIBLE + 1;
 const MIC_WAVE_SHIFT_MS = 46;
 const MIC_WAVE_BAR_STEP = 5;
+const MOBILE_WAVE_BARS = 3;
+const MOBILE_WAVE_UPDATE_MS = 80;
+
+const mobileMicWavePreferred = (() => {
+  try {
+    return window.matchMedia('(pointer: coarse), (max-width: 768px)').matches;
+  } catch {
+    return false;
+  }
+})();
 const MIC_BAR_IDLE = 0.05;
-const MIC_BAR_TRIGGER = 0.2;
+const MIC_BAR_TRIGGER = 0.22;
 const MIC_VOICE_GATE = 0.1;
+const COMPOSE_WAVE_VISIBLE = 12;
 
 let progressRaf = null;
+let transcribeProgressRaf = null;
+let transcribeProgressStartedAt = 0;
+let transcribeProgressEstimateMs = 2500;
 let recordingProgressRaf = null;
 let progressStartedAt = 0;
 let progressEstimateMs = 4000;
 let pendingQueueBusy = false;
 let pendingRetryTimer = null;
+let streamProgressFinished = false;
 let micMeter = null;
 let micMeterCtx = null;
 let micWaveSlots = [];
@@ -160,13 +205,111 @@ function enqueueSpeak(task) {
   return run;
 }
 
-function withTimeout(promise, ms, message) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(message)), ms);
-    }),
-  ]);
+function withTimeout(promise, ms, message, onTimeout) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      onTimeout?.();
+      reject(new Error(message));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function converseTimeoutMs(recordingMs, blobBytes) {
+  const audioSeconds = Math.max(recordingMs / 1000, blobBytes / 12000, 1);
+  return Math.min(240000, Math.max(90000, audioSeconds * 2500 + 45000));
+}
+
+function abortActiveConverse() {
+  if (activeConverseController) {
+    activeConverseController.abort();
+    activeConverseController = null;
+  }
+}
+
+function cancelDraftTranslationPrefetch() {
+  if (!draftTranslationPrefetch) return;
+  draftTranslationPrefetch.controller?.abort();
+  if (draftTranslationPrefetch.hiddenMessage) {
+    cancelMessageAudio(draftTranslationPrefetch.hiddenMessage);
+  }
+  draftTranslationPrefetch = null;
+}
+
+function releaseDraftTranslationPrefetch() {
+  draftTranslationPrefetch = null;
+}
+
+function syncDraftTranslationPrefetch() {
+  const text = getDraftText();
+  if (!draftTranslationPrefetch) return;
+  if (text === draftTranslationPrefetch.sourceText) return;
+  cancelDraftTranslationPrefetch();
+}
+
+function startDraftTranslationPrefetch(text) {
+  const sourceText = String(text ?? '').trim();
+  if (!sourceText || !languagesReady()) return;
+  if (state.isProcessing) return;
+
+  cancelDraftTranslationPrefetch();
+
+  const controller = new AbortController();
+  const prefetchRequestId = ++draftPrefetchSeq;
+  const entry = {
+    sourceText,
+    prefetchRequestId,
+    controller,
+    result: null,
+    error: null,
+    hiddenMessage: {
+      id: `prefetch-${prefetchRequestId}`,
+      translated: '',
+      targetLanguage: null,
+      audioUrl: null,
+    },
+    promise: null,
+  };
+  draftTranslationPrefetch = entry;
+
+  entry.promise = runDraftTranslationPrefetch(entry).catch((err) => {
+    if (err?.name !== 'AbortError') entry.error = err;
+    return null;
+  });
+}
+
+async function runDraftTranslationPrefetch(entry) {
+  if (draftTranslationPrefetch !== entry) return null;
+
+  const data = await sendTextForTranslation({
+    text: entry.sourceText,
+    signal: entry.controller.signal,
+    requestId: entry.prefetchRequestId,
+    mode: 'prefetch',
+    prefetchRef: entry,
+  });
+
+  if (draftTranslationPrefetch === entry && data?.translatedText?.trim()) {
+    entry.result = data;
+  }
+  return data;
+}
+
+function kickoffPrefetchAudio(prefetchRef, doneData) {
+  if (!doneData?.translatedText?.trim() || !prefetchRef?.hiddenMessage) return;
+  const msg = prefetchRef.hiddenMessage;
+  msg.translated = doneData.translatedText;
+  msg.targetLanguage = doneData.targetLanguage;
+  void prefetchAudio(msg);
 }
 
 async function loadMessageAudio(msg, { prefetch = false } = {}) {
@@ -391,6 +534,8 @@ async function init() {
   const ready = await checkHealth();
   if (!ready) return;
 
+  bindKeepWarm();
+
   const authed = await ensureAuthenticated();
   if (!authed) return;
 
@@ -399,8 +544,23 @@ async function init() {
   bindEvents();
   bindMicHelp();
   bindPendingQueue();
+  bindDictation();
   checkMicSupport();
-  updateMicState();
+  ensureComposeLevelBars();
+  if (composeMicProgressFill) {
+    composeMicProgressFill.style.strokeDasharray = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
+    composeMicProgressFill.style.strokeDashoffset = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
+  }
+  if (recordingSendProgressFill) {
+    recordingSendProgressFill.style.strokeDasharray = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
+    recordingSendProgressFill.style.strokeDashoffset = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
+  }
+  resizeDictationInput();
+  updateComposeState();
+  scheduleComposeFocus();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') scheduleComposeFocus();
+  });
   void purgeStalePendingRecordings();
   void refreshPendingBanner();
   wakePendingQueue();
@@ -480,8 +640,8 @@ async function loadLanguages() {
     state.languages = await res.json();
   } catch {
     state.languages = [
-      { code: 'en', name: 'English', flagCode: 'us' },
-      { code: 'es', name: 'Spanish', flagCode: 'es' },
+      { code: 'en', name: 'English' },
+      { code: 'es', name: 'Spanish' },
     ];
   }
 }
@@ -496,7 +656,7 @@ function initPickers() {
   picker1 = createLangPicker($('#lang-picker-1'), {
     languages: state.languages,
     value: state.lang1,
-    placeholder: 'English',
+    placeholder: 'Language',
     onChange: (code) => {
       state.lang1 = code;
       if (state.lang1 === state.lang2) {
@@ -511,7 +671,7 @@ function initPickers() {
   picker2 = createLangPicker($('#lang-picker-2'), {
     languages: state.languages,
     value: state.lang2,
-    placeholder: 'Spanish',
+    placeholder: 'Language',
     onChange: (code) => {
       state.lang2 = code;
       if (state.lang1 === state.lang2) {
@@ -542,9 +702,10 @@ function clearConversation() {
 }
 
 function onLanguagesChanged() {
+  cancelDraftTranslationPrefetch();
   clearConversation();
   saveLanguages();
-  updateMicState();
+  updateComposeState();
 }
 
 function detectBrowser() {
@@ -695,10 +856,27 @@ function languagesReady() {
   return state.lang1 && state.lang2 && state.lang1 !== state.lang2;
 }
 
-function updateMicState() {
+function isRecordingUiActive() {
+  return composeBoxEl?.classList.contains('is-recording');
+}
+
+function setRecordingUI(active) {
+  composeBoxEl?.classList.toggle('is-recording', Boolean(active));
+}
+
+function updateComposeState() {
   const ready = languagesReady();
-  mainMicBtn.disabled = !ready && !state.isRecording && !state.isProcessing;
-  mainMicBtn.setAttribute('aria-label', ready ? 'Tap to speak' : 'Select two languages');
+  const recordingUi = isRecordingUiActive();
+  const busy = recordingUi || state.isRecording || state.isProcessing || state.stoppingRecording;
+  const hasText = Boolean(getDraftText());
+  composeMicBtn.disabled = !ready || busy;
+  composeNewBtn.disabled = busy || !hasText;
+  dictationTranslateBtn.disabled = busy || !hasText;
+  dictationTranslateBtn.classList.toggle('is-ready', hasText && !busy);
+  recordingCancelBtn.disabled = state.stoppingRecording;
+  recordingSendBtn.disabled = !state.isRecording || state.stoppingRecording;
+  dictationInputEl.disabled = recordingUi || state.isRecording || state.isProcessing;
+  syncComposeCaret();
 }
 
 async function checkHealth() {
@@ -715,9 +893,347 @@ async function checkHealth() {
 
 function checkMicSupport() {
   if (!navigator.mediaDevices?.getUserMedia) {
-    mainMicBtn.disabled = true;
+    composeMicBtn.disabled = true;
     showToast('Microphone not supported');
   }
+}
+
+function resizeDictationInput() {
+  if (!dictationInputEl) return;
+  dictationInputEl.style.height = 'auto';
+  dictationInputEl.style.height = `${dictationInputEl.scrollHeight}px`;
+  syncComposeCaret();
+}
+
+function ensureComposeCaretMirror() {
+  if (composeCaretMirrorEl || !composeInputWrapEl) return composeCaretMirrorEl;
+  composeCaretMirrorEl = document.createElement('div');
+  composeCaretMirrorEl.className = 'compose-caret-mirror';
+  composeCaretMirrorEl.setAttribute('aria-hidden', 'true');
+  composeInputWrapEl.appendChild(composeCaretMirrorEl);
+  return composeCaretMirrorEl;
+}
+
+function syncComposeCaret() {
+  const wrap = composeInputWrapEl;
+  const ta = dictationInputEl;
+  const caret = composeCaretEl;
+  if (!wrap || !ta || !caret) return;
+
+  const recording = isRecordingUiActive() || state.isRecording || state.isProcessing;
+  const focused = document.activeElement === ta;
+
+  wrap.classList.toggle('is-focused', focused);
+  wrap.classList.toggle('is-empty', !ta.value);
+
+  if (recording || ta.disabled) {
+    caret.hidden = true;
+    return;
+  }
+
+  caret.hidden = false;
+
+  const mirror = ensureComposeCaretMirror();
+  const style = getComputedStyle(ta);
+  mirror.style.width = `${ta.clientWidth}px`;
+  mirror.style.font = style.font;
+  mirror.style.fontSize = style.fontSize;
+  mirror.style.fontFamily = style.fontFamily;
+  mirror.style.fontWeight = style.fontWeight;
+  mirror.style.lineHeight = style.lineHeight;
+  mirror.style.letterSpacing = style.letterSpacing;
+  mirror.style.padding = style.padding;
+  mirror.style.border = style.border;
+  mirror.style.boxSizing = style.boxSizing;
+
+  const caretPos = focused ? (ta.selectionStart ?? ta.value.length) : ta.value.length;
+  const textBefore = ta.value.slice(0, caretPos);
+  const textAfter = ta.value.slice(caretPos);
+
+  mirror.replaceChildren();
+  mirror.append(document.createTextNode(textBefore));
+  const marker = document.createElement('span');
+  marker.textContent = '\u200b';
+  mirror.append(marker);
+  if (textAfter) mirror.append(document.createTextNode(textAfter));
+
+  const markerRect = marker.getBoundingClientRect();
+  const wrapRect = wrap.getBoundingClientRect();
+  const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.45;
+
+  caret.style.left = `${markerRect.left - wrapRect.left}px`;
+  caret.style.top = `${markerRect.top - wrapRect.top + ta.scrollTop}px`;
+  caret.style.height = `${lineHeight}px`;
+}
+
+function shouldRefocusComposeInput(next) {
+  if (!next) return true;
+  if (next === dictationInputEl) return false;
+  if (next.closest?.('button, .lang-picker, #auth-gate, select, input, textarea, a')) return false;
+  return true;
+}
+
+function focusComposeInput() {
+  if (!dictationInputEl || state.isRecording || state.isProcessing || dictationInputEl.disabled) return;
+  dictationInputEl.focus({ preventScroll: true });
+  const pos = dictationInputEl.value.length;
+  dictationInputEl.setSelectionRange(pos, pos);
+  syncComposeCaret();
+}
+
+function scheduleComposeFocus() {
+  syncComposeCaret();
+  requestAnimationFrame(focusComposeInput);
+  window.setTimeout(focusComposeInput, 80);
+  window.setTimeout(focusComposeInput, 300);
+}
+
+function enterComposerSession() {
+  if (state.composerSession) return;
+  state.composerSession = true;
+  appEl?.classList.add('session-active');
+  requestAnimationFrame(() => {
+    languageBarEl?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+}
+
+function showDraftPanel(text) {
+  const value = String(text ?? '').trim();
+  state.draftText = value;
+  dictationInputEl.value = value;
+  if (!state.composerSession) enterComposerSession();
+  resizeDictationInput();
+  updateComposeState();
+}
+
+function appendToDraft(text, { prefetch = true } = {}) {
+  const addition = String(text ?? '').trim();
+  if (!addition) return;
+  const current = dictationInputEl.value.trim();
+  const combined = current ? `${current} ${addition}` : addition;
+  showDraftPanel(combined);
+  if (!dictationInputEl.value.endsWith(' ')) {
+    dictationInputEl.value += ' ';
+    state.draftText = dictationInputEl.value;
+    resizeDictationInput();
+  }
+  if (prefetch) startDraftTranslationPrefetch(getDraftText());
+  scheduleComposeFocus();
+}
+
+function clearDraftText() {
+  cancelDraftTranslationPrefetch();
+  emptyDraftFields();
+}
+
+function emptyDraftFields() {
+  state.draftText = '';
+  dictationInputEl.value = '';
+  resizeDictationInput();
+  updateComposeState();
+  scheduleComposeFocus();
+}
+
+function getDraftText() {
+  return dictationInputEl.value.trim() || state.draftText.trim();
+}
+
+function bindDictation() {
+  dictationInputEl.addEventListener('input', () => {
+    state.draftText = dictationInputEl.value;
+    syncDraftTranslationPrefetch();
+    resizeDictationInput();
+    updateComposeState();
+  });
+  dictationInputEl.addEventListener('focus', syncComposeCaret);
+  dictationInputEl.addEventListener('blur', (e) => {
+    if (shouldRefocusComposeInput(e.relatedTarget)) {
+      requestAnimationFrame(focusComposeInput);
+      return;
+    }
+    requestAnimationFrame(syncComposeCaret);
+  });
+  dictationInputEl.addEventListener('keyup', syncComposeCaret);
+  dictationInputEl.addEventListener('click', syncComposeCaret);
+  dictationInputEl.addEventListener('scroll', syncComposeCaret, { passive: true });
+  document.addEventListener('selectionchange', () => {
+    if (document.activeElement === dictationInputEl) syncComposeCaret();
+  });
+  composeBoxEl?.addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    focusComposeInput();
+  });
+  dictationTranslateBtn.addEventListener('click', () => {
+    void translateDraft();
+  });
+  composeNewBtn.addEventListener('click', () => {
+    clearDraftText();
+  });
+  window.addEventListener('resize', () => {
+    resizeDictationInput();
+    syncComposeCaret();
+  }, { passive: true });
+}
+
+async function translateDraft() {
+  const text = getDraftText();
+  if (!text) {
+    showToast('Enter or dictate something first');
+    return;
+  }
+  if (state.isProcessing || state.isRecording || state.stoppingRecording) return;
+
+  abortActiveConverse();
+  const controller = new AbortController();
+  activeConverseController = controller;
+  const requestId = ++latestTranslationRequest;
+  const prefetch = draftTranslationPrefetch;
+  const matchesPrefetch = prefetch?.sourceText === text;
+
+  state.isProcessing = true;
+  updateComposeState();
+
+  try {
+    if (matchesPrefetch && prefetch.result) {
+      await applyTranslationResult(prefetch.result, { requestId, prefetchEntry: prefetch });
+      releaseDraftTranslationPrefetch();
+      emptyDraftFields();
+      return;
+    }
+
+    beginTranslationPanel(text, requestId);
+
+    if (matchesPrefetch && prefetch.promise) {
+      const data = await prefetch.promise;
+      if (getDraftText() !== text) {
+        throw new Error('Message changed');
+      }
+      if (data?.translatedText?.trim()) {
+        await applyTranslationResult(data, { requestId, prefetchEntry: prefetch });
+        releaseDraftTranslationPrefetch();
+        emptyDraftFields();
+        return;
+      }
+    }
+
+    cancelDraftTranslationPrefetch();
+    await sendTextForTranslation({ text, signal: controller.signal, requestId });
+    releaseDraftTranslationPrefetch();
+    emptyDraftFields();
+  } catch (err) {
+    if (err?.name === 'AbortError') return;
+    stopLoadingDots();
+    state.messages = [];
+    renderConversation();
+    showDraftPanel(text);
+    showToast(err.message || 'Translation failed');
+  } finally {
+    stopLoadingDots();
+    if (activeConverseController === controller) {
+      activeConverseController = null;
+    }
+    resetMicUI();
+  }
+}
+
+async function sendTextForTranslation({ text, signal, requestId, mode = 'active', prefetchRef }) {
+  let res;
+  try {
+    res = await withTimeout(
+      apiFetch('/api/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          lang1: state.lang1,
+          lang2: state.lang2,
+          context: buildConversationContext(),
+        }),
+        signal,
+      }),
+      60000,
+      'Request timed out',
+      () => {},
+    );
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    const error = new Error(err.message || 'Cannot connect to server');
+    error.retryable = true;
+    throw error;
+  }
+
+  if (res.status === 401) {
+    const error = new Error('Session expired — enter the access code again');
+    error.retryable = true;
+    throw error;
+  }
+
+  let data = {};
+  if (!res.ok) {
+    try {
+      data = await res.json();
+    } catch {
+      data = {};
+    }
+    const error = new Error(data.error || 'Processing failed');
+    error.retryable = isRetryableSendError(error, res);
+    throw error;
+  }
+
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('ndjson')) {
+    throw new Error('Unexpected server response');
+  }
+
+  data = await consumeConverseStream(res, { requestId, signal, mode, prefetchRef });
+  if (!data.translatedText?.trim()) {
+    throw new Error('Could not translate');
+  }
+
+  if (mode === 'prefetch') {
+    return data;
+  }
+
+  if (requestId !== latestTranslationRequest) return;
+  await applyTranslationResult(data, { requestId });
+}
+
+async function fetchTranscriptFromAudio({ blob, mimeType }) {
+  const form = new FormData();
+  form.append('audio', blob, `audio.${mimeType.includes('mp4') ? 'mp4' : 'webm'}`);
+  form.append('lang1', state.lang1);
+  form.append('lang2', state.lang2);
+
+  const timeoutMs = Math.min(90000, Math.max(15000, 12000 + (blob?.size || 0) / 8));
+
+  const res = await withTimeout(
+    apiFetch('/api/transcribe', {
+      method: 'POST',
+      body: form,
+    }),
+    timeoutMs,
+    'Transcription timed out',
+    () => {},
+  );
+
+  let data = {};
+  try {
+    data = await res.json();
+  } catch {
+    data = {};
+  }
+
+  if (!res.ok) {
+    throw new Error(data.error || 'Could not transcribe audio');
+  }
+
+  return data.rawText?.trim() || '';
+}
+
+function warmMicForRecording() {
+  if (!languagesReady() || state.isProcessing || state.isRecording || state.stoppingRecording) return;
+  primeMicAudioOnGesture();
+  void ensureMicStream().catch(() => {});
 }
 
 async function ensureMicStream() {
@@ -744,15 +1260,61 @@ function estimateProcessingMs(recordingMs, blobBytes) {
   return Math.round(MIN_MS + t * (MAX_MS - MIN_MS));
 }
 
-function simulatedProgress(elapsedMs) {
-  const target = progressEstimateMs;
+function estimateTranscribeMs(recordingMs, blobBytes) {
+  const MIN_MS = 1000;
+  const MAX_MS = 3500;
+  const audioSeconds = Math.max(recordingMs / 1000, blobBytes / 14000, 0.4);
+  const t = Math.min(audioSeconds / 12, 1);
+  return Math.round(MIN_MS + t * (MAX_MS - MIN_MS));
+}
+
+function simulatedProgress(elapsedMs, estimateMs = progressEstimateMs) {
+  const target = estimateMs;
   const ratio = elapsedMs / target;
 
   if (ratio <= 1) return ratio * 97;
 
-  // Past estimate: creep slowly so the bar never looks frozen
   const overtime = elapsedMs - target;
   return Math.min(97 + (overtime / (target * 0.6)) * 2, 99);
+}
+
+function updateMicTranscribeProgress(pct) {
+  if (!composeMicProgressFill) return;
+  const offset = COMPOSE_MIC_RING_CIRCUMFERENCE * (1 - pct / 100);
+  composeMicProgressFill.style.strokeDashoffset = String(offset);
+  composeMicProgressFill.style.stroke = rgbCss(processingRgb(pct));
+}
+
+function startMicTranscribeProgress(recordingMs, blobBytes) {
+  stopMicTranscribeProgress();
+  transcribeProgressEstimateMs = estimateTranscribeMs(recordingMs, blobBytes);
+  transcribeProgressStartedAt = performance.now();
+  composeMicBtn?.classList.add('is-transcribing');
+  composeMicBtn?.setAttribute('aria-busy', 'true');
+  composeMicBtn?.setAttribute('aria-label', 'Transcribing audio');
+  updateMicTranscribeProgress(0);
+
+  const tick = (now) => {
+    const elapsed = now - transcribeProgressStartedAt;
+    updateMicTranscribeProgress(simulatedProgress(elapsed, transcribeProgressEstimateMs));
+    transcribeProgressRaf = requestAnimationFrame(tick);
+  };
+
+  transcribeProgressRaf = requestAnimationFrame(tick);
+}
+
+function stopMicTranscribeProgress() {
+  if (transcribeProgressRaf) cancelAnimationFrame(transcribeProgressRaf);
+  transcribeProgressRaf = null;
+
+  composeMicBtn?.classList.remove('is-transcribing');
+  composeMicBtn?.removeAttribute('aria-busy');
+  composeMicBtn?.setAttribute('aria-label', 'Record message');
+
+  if (composeMicProgressFill) {
+    composeMicProgressFill.style.strokeDashoffset = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
+    composeMicProgressFill.style.removeProperty('stroke');
+  }
 }
 
 const PROCESSING_COLOR_STOPS = [
@@ -793,38 +1355,16 @@ function rgbCss({ r, g, b }, alpha = 1) {
   return alpha === 1 ? `rgb(${r}, ${g}, ${b})` : `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
-function applyProcessingVisuals(pct) {
-  const rgb = processingRgb(pct);
-  const dark = {
-    r: Math.round(rgb.r * 0.58),
-    g: Math.round(rgb.g * 0.58),
-    b: Math.round(rgb.b * 0.58),
-  };
-
-  progressRingFill.style.stroke = rgbCss(rgb);
-  if (!mainMicBtn.classList.contains('processing')) return;
-
-  mainMicBtn.style.background = `linear-gradient(145deg, ${rgbCss(rgb)}, ${rgbCss(dark)})`;
-  mainMicBtn.style.boxShadow = `inset 0 0 0 2px ${rgbCss(rgb, 0.42)}, 0 4px 28px ${rgbCss(rgb, 0.28)}`;
+function applyProcessingVisuals(_pct) {
+  // Progress visuals handled via .compose-box.is-processing
 }
 
 function clearProcessingVisuals() {
-  progressRingFill.style.removeProperty('stroke');
-  mainMicBtn.style.removeProperty('background');
-  mainMicBtn.style.removeProperty('box-shadow');
+  composeBoxEl?.classList.remove('is-processing');
 }
 
-function updateProgressRing(pct) {
-  const value = Math.round(pct);
-  const offset = RING_CIRCUMFERENCE * (1 - pct / 100);
-  progressRingFill.style.strokeDashoffset = String(offset);
-  progressRing.setAttribute('aria-valuenow', String(value));
-
-  if (micRingWrap.classList.contains('is-active')) {
-    applyProcessingVisuals(pct);
-  } else if (micRingWrap.classList.contains('is-recording')) {
-    progressRingFill.style.stroke = '#f87171';
-  }
+function updateProgressRing(_pct) {
+  // Legacy no-op — progress ring removed
 }
 
 function getMicMeterContext() {
@@ -842,7 +1382,13 @@ function primeMicAudioOnGesture() {
   void ctx.resume();
 }
 
-async function prepareMicMeter(stream) {
+function prepareMicMeter(stream) {
+  if (micMeter?.stream === stream) {
+    const ctx = getMicMeterContext();
+    if (ctx?.state === 'suspended') void ctx.resume();
+    return;
+  }
+
   teardownMicMeter();
 
   const ctx = getMicMeterContext();
@@ -860,6 +1406,7 @@ async function prepareMicMeter(stream) {
   silentGain.connect(ctx.destination);
 
   micMeter = {
+    stream,
     source,
     analyser,
     silentGain,
@@ -868,18 +1415,7 @@ async function prepareMicMeter(stream) {
     smooth: 0,
   };
 
-  if (ctx.state !== 'running') {
-    try {
-      await ctx.resume();
-    } catch {
-      // ignore resume errors
-    }
-  }
-
-  for (let i = 0; i < 4; i++) {
-    micMeter.analyser.getByteTimeDomainData(micMeter.timeData);
-    micMeter.analyser.getByteFrequencyData(micMeter.freqData);
-  }
+  if (ctx.state !== 'running') void ctx.resume();
 }
 
 function readMicLevel() {
@@ -907,17 +1443,25 @@ function readMicLevel() {
   return micMeter.smooth;
 }
 
-function ensureMicWaveform() {
-  if (!micWaveformEl || micWaveBarEls.length) return;
+function isMobileMicWave() {
+  return mobileMicWavePreferred;
+}
 
+function ensureComposeLevelBars() {
+  if (!composeLevelEl) return;
+  if (micWaveScrollEl && micWaveBarEls.length === MIC_WAVE_TOTAL) return;
+
+  composeLevelEl.style.setProperty('--compose-wave-visible', String(COMPOSE_WAVE_VISIBLE));
+  composeLevelEl.innerHTML = '';
+  micWaveBarEls.length = 0;
   micWaveScrollEl = document.createElement('span');
-  micWaveScrollEl.className = 'mic-wave-scroll';
-  micWaveformEl.appendChild(micWaveScrollEl);
+  micWaveScrollEl.className = 'compose-level-scroll';
+  composeLevelEl.appendChild(micWaveScrollEl);
 
   micWaveSlots = Array(MIC_WAVE_TOTAL).fill(MIC_BAR_IDLE);
   for (let i = 0; i < MIC_WAVE_TOTAL; i++) {
     const bar = document.createElement('span');
-    bar.className = 'mic-wave-bar';
+    bar.className = 'compose-level-bar';
     bar.style.setProperty('--bar-scale', String(MIC_BAR_IDLE));
     micWaveScrollEl.appendChild(bar);
     micWaveBarEls.push(bar);
@@ -934,25 +1478,25 @@ function isMicSilent(level) {
     sum += sample * sample;
   }
   const instant = Math.sqrt(sum / micMeter.timeData.length);
-  return level < MIC_VOICE_GATE && instant < 0.03;
+  return level < MIC_VOICE_GATE && instant < 0.025;
 }
 
 function computeWaveSample(level, silent) {
   if (silent || !micMeter) return MIC_BAR_IDLE;
 
   micMeter.analyser.getByteFrequencyData(micMeter.freqData);
-  const voiceBins = Math.max(8, Math.floor(micMeter.freqData.length * 0.45));
+  const voiceBins = Math.max(8, Math.floor(micMeter.freqData.length * 0.4));
   let peak = 0;
   for (let b = 2; b < 2 + voiceBins; b++) {
     peak = Math.max(peak, micMeter.freqData[b] / 255);
   }
 
   const gated = Math.max(0, peak - MIC_BAR_TRIGGER) / (1 - MIC_BAR_TRIGGER);
-  if (gated < 0.04) return MIC_BAR_IDLE;
+  if (gated < 0.07) return MIC_BAR_IDLE;
 
-  const boosted = Math.min(1, gated * (1.15 + level * 0.85));
-  const shaped = Math.pow(boosted, 1.45);
-  return MIC_BAR_IDLE + shaped * (1 - MIC_BAR_IDLE);
+  const voiceLevel = Math.max(gated, Math.max(0, level - MIC_VOICE_GATE) * 0.55);
+  const compressed = Math.pow(Math.min(1, voiceLevel * 0.82), 1.8);
+  return MIC_BAR_IDLE + compressed * (1 - MIC_BAR_IDLE);
 }
 
 function finishMicWaveShift() {
@@ -985,25 +1529,21 @@ function shiftMicWaveform(sample) {
 }
 
 function applyMicVoicePulse() {
-  const level = readMicLevel();
-  mainMicBtn.style.setProperty('--mic-voice-scale', (1 + level * 0.18).toFixed(3));
-  mainMicBtn.style.setProperty('--mic-voice-glow', level.toFixed(3));
-
-  ensureMicWaveform();
+  ensureComposeLevelBars();
   if (!micMeter) return;
 
   const now = performance.now();
   if (now - micWaveLastShift < MIC_WAVE_SHIFT_MS || micWaveShiftBusy) return;
   micWaveLastShift = now;
 
-  const sample = computeWaveSample(level, isMicSilent(level));
+  const level = readMicLevel();
+  const silent = isMicSilent(level);
+  if (silent && micMeter) micMeter.smooth *= 0.62;
+  const sample = computeWaveSample(level, silent);
   shiftMicWaveform(sample);
 }
 
 function clearMicVoicePulse() {
-  mainMicBtn.style.removeProperty('--mic-voice-scale');
-  mainMicBtn.style.removeProperty('--mic-voice-glow');
-
   micWaveLastShift = 0;
   micWaveShiftBusy = false;
   if (!micWaveBarEls.length) return;
@@ -1034,18 +1574,28 @@ function cancelRecordingProgressRaf() {
   recordingProgressRaf = null;
 }
 
+function resetRecordingSendProgress() {
+  if (!recordingSendProgressFill) return;
+  recordingSendProgressFill.style.strokeDashoffset = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
+}
+
+function updateRecordingSendProgress(pct) {
+  if (!recordingSendProgressFill) return;
+  const clamped = Math.min(100, Math.max(0, pct));
+  const offset = COMPOSE_MIC_RING_CIRCUMFERENCE * (1 - clamped / 100);
+  recordingSendProgressFill.style.strokeDashoffset = String(offset);
+}
+
 function stopRecordingProgress() {
   cancelRecordingProgressRaf();
-  micRingWrap.classList.remove('is-recording');
-  teardownMicMeter();
+  clearMicVoicePulse();
+  resetRecordingSendProgress();
 }
 
 async function startRecordingProgress() {
   cancelRecordingProgressRaf();
   stopProgress();
-  micRingWrap.classList.add('is-recording');
-  progressRing.setAttribute('aria-label', 'Recording progress');
-  updateProgressRing(0);
+  updateRecordingSendProgress(0);
 
   const tick = () => {
     if (!state.isRecording) return;
@@ -1053,11 +1603,13 @@ async function startRecordingProgress() {
     applyMicVoicePulse();
 
     const elapsed = Date.now() - state.recordingStartedAt;
-    updateProgressRing(Math.min((elapsed / MAX_RECORDING_MS) * 100, 100));
+    const pct = (elapsed / MAX_RECORDING_MS) * 100;
+    updateRecordingSendProgress(pct);
 
     if (elapsed >= MAX_RECORDING_MS) {
+      updateRecordingSendProgress(100);
       cancelRecordingProgressRaf();
-      void stopRecording({ autoLimit: true });
+      void acceptRecording({ autoLimit: true });
       return;
     }
 
@@ -1068,14 +1620,12 @@ async function startRecordingProgress() {
 }
 
 function startProgress(estimatedMs) {
+  streamProgressFinished = false;
   stopRecordingProgress();
   stopProgress();
   progressEstimateMs = estimatedMs;
   progressStartedAt = performance.now();
-  micRingWrap.classList.add('is-active');
-  progressRing.setAttribute('aria-label', 'Translation progress');
-  updateProgressRing(0);
-  applyProcessingVisuals(0);
+  composeBoxEl?.classList.add('is-processing');
 
   const tick = (now) => {
     const elapsed = now - progressStartedAt;
@@ -1089,10 +1639,7 @@ function startProgress(estimatedMs) {
 function finishProgress() {
   return new Promise((resolve) => {
     stopProgress();
-    micRingWrap.classList.remove('is-active');
-    updateProgressRing(100);
     setTimeout(() => {
-      updateProgressRing(0);
       resolve();
     }, 220);
   });
@@ -1101,8 +1648,6 @@ function finishProgress() {
 function stopProgress() {
   if (progressRaf) cancelAnimationFrame(progressRaf);
   progressRaf = null;
-  micRingWrap.classList.remove('is-active');
-  micRingWrap.classList.remove('is-recording');
   clearProcessingVisuals();
 }
 
@@ -1117,38 +1662,310 @@ function buildConversationContext() {
     }));
 }
 
-function applyTranslationResult(data) {
+async function applyTranslationResult(data, { requestId, prefetchEntry } = {}) {
+  if (requestId !== undefined && requestId !== latestTranslationRequest) return;
+
+  stopLoadingDots();
+
+  const prev = state.messages[0];
+  const streamId = requestId !== undefined ? `stream-${requestId}` : null;
+
   const message = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    original: data.sourceText || data.rawText,
+    original: data.rawText || data.sourceText,
     translated: data.translatedText,
     detectedLanguage: data.detectedLanguage,
     targetLanguage: data.targetLanguage,
     audioUrl: null,
   };
 
+  if (prev?._streaming && streamId && prev.id === streamId) {
+    if (prev.audioUrl) message.audioUrl = prev.audioUrl;
+    if (prev._audioPromise) message._audioPromise = prev._audioPromise;
+    if (prev._speakAbort) message._speakAbort = prev._speakAbort;
+  }
+
+  const hidden = prefetchEntry?.hiddenMessage;
+  if (hidden) {
+    if (hidden.audioUrl) message.audioUrl = hidden.audioUrl;
+    if (hidden._audioPromise) message._audioPromise = hidden._audioPromise;
+    if (hidden._speakAbort) message._speakAbort = hidden._speakAbort;
+  }
+
   state.messages = [message];
+  lastTranslationAppliedAt = Date.now();
+  pendingQueuePausedUntil = lastTranslationAppliedAt + 8000;
   prepareForNewTranslation(message);
   renderConversation();
   startBackgroundAudio(message);
-  void clearAllPendingRecordings();
+  await clearAllPendingRecordings();
+}
+
+function beginTranslationPanel(sourceText, requestId) {
+  if (requestId !== undefined && requestId !== latestTranslationRequest) return;
+
+  if (!state.composerSession) enterComposerSession();
+
+  const message = {
+    id: `stream-${requestId}`,
+    original: sourceText,
+    translated: '',
+    detectedLanguage: null,
+    targetLanguage: null,
+    audioUrl: null,
+    _streaming: true,
+    _loading: true,
+  };
+
+  state.messages = [message];
+  state.latestMessageId = message.id;
+  renderConversation();
+}
+
+function maxLoadingDots(textLength) {
+  const chars = Math.max(textLength, 1);
+  return Math.min(LOADING_DOT_MAX, Math.max(3, Math.ceil(chars / 12)));
+}
+
+function stopLoadingDots() {
+  if (loadingLetterTimer) clearInterval(loadingLetterTimer);
+  loadingLetterTimer = null;
+  if (loadingDotsTimer) clearInterval(loadingDotsTimer);
+  loadingDotsTimer = null;
+}
+
+function startLoadingDots(hostEl, textLength) {
+  stopLoadingDots();
+  const brandEl = hostEl?.querySelector('.translation-loading-brand');
+  const dotsEl = hostEl?.querySelector('.translation-loading-dots');
+  if (!brandEl || !dotsEl) return;
+
+  const cap = maxLoadingDots(textLength);
+  let letterIndex = 0;
+  let dotCount = 0;
+
+  brandEl.textContent = '';
+  dotsEl.textContent = '';
+
+  loadingLetterTimer = window.setInterval(() => {
+    const message = state.messages[0];
+    if (!message?._loading) {
+      stopLoadingDots();
+      return;
+    }
+
+    if (letterIndex < LOADING_BRAND_TEXT.length) {
+      letterIndex += 1;
+      brandEl.textContent = LOADING_BRAND_TEXT.slice(0, letterIndex);
+      if (letterIndex < LOADING_BRAND_TEXT.length) return;
+
+      clearInterval(loadingLetterTimer);
+      loadingLetterTimer = null;
+
+      loadingDotsTimer = window.setInterval(() => {
+        const active = state.messages[0];
+        if (!active?._loading) {
+          stopLoadingDots();
+          return;
+        }
+        if (dotCount >= cap) return;
+        dotCount += 1;
+        dotsEl.textContent += '.';
+      }, LOADING_DOT_MS);
+    }
+  }, LOADING_LETTER_MS);
+}
+
+function showStreamingTranscript(rawText, requestId) {
+  if (requestId !== undefined && requestId !== latestTranslationRequest) return;
+
+  const existing = state.messages[0];
+  if (existing?._streaming && existing.id === `stream-${requestId}`) {
+    existing.original = rawText;
+    return;
+  }
+
+  const message = {
+    id: `stream-${requestId}`,
+    original: rawText,
+    translated: '',
+    detectedLanguage: null,
+    targetLanguage: null,
+    audioUrl: null,
+    _streaming: true,
+    _loading: true,
+  };
+
+  state.messages = [message];
+  state.latestMessageId = message.id;
+  renderConversation();
+}
+
+function appendStreamingTranslation(text, requestId) {
+  if (requestId !== undefined && requestId !== latestTranslationRequest) return;
+
+  const message = state.messages[0];
+  if (!message?._streaming) return;
+
+  const translatedEl = getMessageCardEl(message)?.querySelector('.message-translated-text');
+  if (message._loading) {
+    stopLoadingDots();
+    message._loading = false;
+    if (translatedEl) {
+      translatedEl.classList.remove('is-loading');
+      translatedEl.removeAttribute('aria-busy');
+      translatedEl.textContent = '';
+    }
+  }
+
+  message.translated += text;
+  if (translatedEl) {
+    translatedEl.textContent = message.translated;
+    translatedEl.classList.add('is-streaming');
+  }
+}
+
+function kickoffTranslationAudio(doneData, requestId) {
+  if (requestId !== undefined && requestId !== latestTranslationRequest) return;
+  if (!doneData?.translatedText?.trim()) return;
+
+  const message = state.messages[0];
+  if (!message?._streaming || message.id !== `stream-${requestId}`) return;
+
+  message.translated = doneData.translatedText;
+  message.detectedLanguage = doneData.detectedLanguage;
+  message.targetLanguage = doneData.targetLanguage;
+  startBackgroundAudio(message);
+}
+
+function handleStreamEvent(evt, requestId) {
+  if (!evt?.event) return;
+
+  if (evt.event === 'transcript') {
+    showStreamingTranscript(evt.rawText, requestId);
+    return;
+  }
+
+  if (evt.event === 'delta') {
+    appendStreamingTranslation(evt.text || '', requestId);
+    return;
+  }
+
+  if (evt.event === 'error') {
+    const error = new Error(evt.error || 'Processing failed');
+    error.retryable = true;
+    throw error;
+  }
+}
+
+async function consumeConverseStream(res, { requestId, signal, mode = 'active', prefetchRef } = {}) {
+  if (!res.body) {
+    throw new Error('No response body');
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finalData = null;
+
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        await reader.cancel();
+        throw new DOMException('Aborted', 'AbortError');
+      }
+
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const evt = JSON.parse(line);
+        if (evt.event === 'done') {
+          finalData = evt;
+          if (mode === 'prefetch') {
+            kickoffPrefetchAudio(prefetchRef, evt);
+          } else {
+            kickoffTranslationAudio(evt, requestId);
+          }
+          continue;
+        }
+        if (mode === 'prefetch') {
+          if (evt.event === 'error') {
+            const error = new Error(evt.error || 'Processing failed');
+            error.retryable = true;
+            throw error;
+          }
+          continue;
+        }
+        handleStreamEvent(evt, requestId);
+      }
+    }
+
+    if (buffer.trim()) {
+      const evt = JSON.parse(buffer);
+      if (evt.event === 'done') {
+        finalData = evt;
+        if (mode === 'prefetch') {
+          kickoffPrefetchAudio(prefetchRef, evt);
+        } else {
+          kickoffTranslationAudio(evt, requestId);
+        }
+      } else if (mode === 'prefetch') {
+        if (evt.event === 'error') {
+          const error = new Error(evt.error || 'Processing failed');
+          error.retryable = true;
+          throw error;
+        }
+      } else {
+        handleStreamEvent(evt, requestId);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!finalData) {
+    const error = new Error('Connection interrupted — message saved for retry');
+    error.retryable = true;
+    throw error;
+  }
+
+  return finalData;
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchConverse(formFactory, { attempts = 3 } = {}) {
+async function fetchConverse(formFactory, { attempts = 3, signal, timeoutMs = 120000 } = {}) {
   let lastError;
   let lastRes;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    const attemptController = new AbortController();
+    const onAbort = () => attemptController.abort();
+    signal?.addEventListener('abort', onAbort);
+
     try {
       const body = typeof formFactory === 'function' ? formFactory() : formFactory;
       const res = await withTimeout(
-        apiFetch('/api/converse', { method: 'POST', body }),
-        120000,
+        apiFetch('/api/converse', {
+          method: 'POST',
+          body,
+          signal: attemptController.signal,
+        }),
+        timeoutMs,
         'Request timed out — message saved',
+        () => attemptController.abort(),
       );
       lastRes = res;
 
@@ -1160,11 +1977,14 @@ async function fetchConverse(formFactory, { attempts = 3 } = {}) {
 
       return res;
     } catch (err) {
+      if (err?.name === 'AbortError') throw err;
       lastError = err;
       if (attempt < attempts) {
         await sleep(retryDelayMs(attempt));
         continue;
       }
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
     }
   }
 
@@ -1180,9 +2000,20 @@ function clampRecordingMs(ms) {
   return Math.min(ms, MAX_RECORDING_MS);
 }
 
-async function submitRecording({ blob, mimeType, recordingMs, lang1, lang2, context, pendingId }) {
+async function submitRecording({
+  blob,
+  mimeType,
+  recordingMs,
+  lang1,
+  lang2,
+  context,
+  pendingId,
+  signal,
+  requestId,
+}) {
   const id = pendingId || crypto.randomUUID();
   const safeRecordingMs = clampRecordingMs(recordingMs);
+  const timeoutMs = converseTimeoutMs(safeRecordingMs, blob?.size || 0);
 
   if (!pendingId) {
     await savePendingRecording({
@@ -1209,8 +2040,13 @@ async function submitRecording({ blob, mimeType, recordingMs, lang1, lang2, cont
 
   let res;
   try {
-    res = await fetchConverse(buildForm, { attempts: pendingId ? 2 : 3 });
+    res = await fetchConverse(buildForm, {
+      attempts: pendingId ? 2 : 3,
+      signal,
+      timeoutMs,
+    });
   } catch (err) {
+    if (err?.name === 'AbortError') throw err;
     const current = (await listPendingRecordings()).find((item) => item.id === id);
     await updatePendingRecording(id, {
       attempts: (current?.attempts || 0) + 1,
@@ -1220,10 +2056,26 @@ async function submitRecording({ blob, mimeType, recordingMs, lang1, lang2, cont
   }
 
   let data = {};
-  try {
-    data = await res.json();
-  } catch {
-    data = {};
+  const contentType = res.headers.get('content-type') || '';
+
+  if (res.ok && contentType.includes('ndjson')) {
+    try {
+      data = await consumeConverseStream(res, { requestId, signal });
+    } catch (err) {
+      if (err?.name === 'AbortError') throw err;
+      const current = (await listPendingRecordings()).find((item) => item.id === id);
+      await updatePendingRecording(id, {
+        attempts: (current?.attempts || 0) + 1,
+        lastError: err.message,
+      });
+      throw err;
+    }
+  } else {
+    try {
+      data = await res.json();
+    } catch {
+      data = {};
+    }
   }
 
   if (res.status === 401) {
@@ -1278,11 +2130,13 @@ function schedulePendingRetry(delayMs = 5000) {
 }
 
 function wakePendingQueue() {
+  if (Date.now() < pendingQueuePausedUntil) return;
   schedulePendingRetry(400);
 }
 
 async function processPendingQueue() {
   if (pendingQueueBusy || state.isProcessing || state.isRecording) return;
+  if (Date.now() < pendingQueuePausedUntil) return;
   if (!navigator.onLine) {
     await refreshPendingBanner();
     return;
@@ -1294,17 +2148,21 @@ async function processPendingQueue() {
     return;
   }
 
+  const actionable = items.filter((item) => item.createdAt > lastTranslationAppliedAt);
+  if (!actionable.length) {
+    await clearAllPendingRecordings();
+    return;
+  }
+
   pendingQueueBusy = true;
-  const item = items.sort((a, b) => b.createdAt - a.createdAt)[0];
+  const item = actionable.sort((a, b) => b.createdAt - a.createdAt)[0];
   const requestId = latestTranslationRequest;
 
   try {
     if (state.isRecording) return;
 
     state.isProcessing = true;
-    mainMicBtn.classList.add('processing');
-    mainMicBtn.setAttribute('aria-label', 'Translating…');
-    mainMicBtn.disabled = true;
+    composeBoxEl.classList.add('is-processing');
     startProgress(estimateProcessingMs(item.recordingMs, item.blob?.size || 0));
 
     const context = JSON.parse(item.contextJson || '[]');
@@ -1316,13 +2174,16 @@ async function processPendingQueue() {
       lang2: item.lang2,
       context,
       pendingId: item.id,
+      requestId,
     });
 
     if (requestId !== latestTranslationRequest) return;
+    if (item.createdAt <= lastTranslationAppliedAt) return;
 
-    applyTranslationResult(data);
-    await finishProgress();
+    await applyTranslationResult(data, { requestId });
+    if (!streamProgressFinished) await finishProgress();
   } catch (err) {
+    if (err?.name === 'AbortError') return;
     if (err.retryable !== false) {
       if (err.message?.includes('Session expired') && authRequired) {
         showAuthGate();
@@ -1355,62 +2216,180 @@ function bindPendingQueue() {
 }
 
 async function sendRecordingForTranslation({ blob, mimeType, recordingMs }) {
+  abortActiveConverse();
+  const controller = new AbortController();
+  activeConverseController = controller;
   const requestId = ++latestTranslationRequest;
-  const data = await submitRecording({
-    blob,
-    mimeType,
-    recordingMs,
-    lang1: state.lang1,
-    lang2: state.lang2,
-    context: buildConversationContext(),
-  });
-  if (requestId !== latestTranslationRequest) return;
-  applyTranslationResult(data);
+
+  try {
+    const data = await submitRecording({
+      blob,
+      mimeType,
+      recordingMs,
+      lang1: state.lang1,
+      lang2: state.lang2,
+      context: buildConversationContext(),
+      signal: controller.signal,
+      requestId,
+    });
+    if (requestId !== latestTranslationRequest) return;
+    await applyTranslationResult(data, { requestId });
+  } catch (err) {
+    if (err?.name === 'AbortError') return;
+    throw err;
+  } finally {
+    if (activeConverseController === controller) {
+      activeConverseController = null;
+    }
+  }
 }
 
-async function toggleRecording() {
+async function beginRecording() {
   if (!languagesReady()) {
     showToast('Select two languages');
     return;
   }
-  if (state.isProcessing || state.stoppingRecording) return;
+  if (state.isProcessing || state.stoppingRecording || state.isRecording || isRecordingUiActive()) return;
 
-  if (state.isRecording) {
-    await stopRecording();
-  } else {
-    primeMicAudioOnGesture();
-    await startRecording();
-  }
-}
-
-async function startRecording() {
+  const sessionId = ++recordingSessionId;
+  primeMicAudioOnGesture();
+  abortActiveConverse();
+  cancelDraftTranslationPrefetch();
   latestTranslationRequest++;
   stopPlayback();
+  clearMicVoicePulse();
+  state.audioChunks = [];
+  ensureComposeLevelBars();
+  setRecordingUI(true);
+  updateComposeState();
+
   try {
-    await ensureMicStream();
-    await prepareMicMeter(state.mediaStream);
-    clearMicVoicePulse();
-    state.audioChunks = [];
+    const stream = await ensureMicStream();
+    if (sessionId !== recordingSessionId) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+
+    prepareMicMeter(stream);
 
     const mimeType = getMimeType();
     state.mediaRecorder = mimeType
-      ? new MediaRecorder(state.mediaStream, { mimeType })
-      : new MediaRecorder(state.mediaStream);
+      ? new MediaRecorder(stream, { mimeType })
+      : new MediaRecorder(stream);
 
     state.mediaRecorder.ondataavailable = (e) => {
       if (e.data.size > 0) state.audioChunks.push(e.data);
     };
 
-    // Timeslice helps mobile browsers flush audio chunks reliably
     state.mediaRecorder.start(250);
     state.recordingStartedAt = Date.now();
     state.isRecording = true;
-    mainMicBtn.classList.add('recording');
-    liveTranscript.hidden = true;
+    state.mediaStream = stream;
+
+    updateComposeState();
     startRecordingProgress();
   } catch (err) {
+    if (sessionId !== recordingSessionId) return;
+    setRecordingUI(false);
     showMicHelp(err);
     releaseMic();
+    updateComposeState();
+  }
+}
+
+async function cancelRecording() {
+  if (!isRecordingUiActive()) return;
+
+  recordingSessionId++;
+  state.isRecording = false;
+  state.stoppingRecording = false;
+  stopRecordingProgress();
+  setRecordingUI(false);
+
+  try {
+    const recorder = state.mediaRecorder;
+    if (recorder && recorder.state !== 'inactive') {
+      await waitForRecorderStop(recorder);
+    }
+  } catch {
+    // ignore stop errors while cancelling
+  }
+
+  state.audioChunks = [];
+  cleanupRecorder();
+  teardownMicMeter();
+  releaseMicTracks();
+  updateComposeState();
+}
+
+async function acceptRecording({ autoLimit = false } = {}) {
+  if (state.stoppingRecording) return;
+  if (!state.isRecording) return;
+
+  state.stoppingRecording = true;
+  const mimeType = state.mediaRecorder?.mimeType || 'audio/webm';
+
+  try {
+    if (!autoLimit) {
+      await sleep(RECORDING_TAIL_MS);
+    }
+
+    state.isRecording = false;
+    stopRecordingProgress();
+    setRecordingUI(false);
+
+    const recorder = state.mediaRecorder;
+    if (recorder && recorder.state !== 'inactive') {
+      await waitForRecorderStop(recorder);
+    }
+
+    const blob = buildRecordingBlob(mimeType);
+    state.audioChunks = [];
+    cleanupRecorder();
+    teardownMicMeter();
+    releaseMicTracks();
+
+    const recordingMs = clampRecordingMs(
+      state.recordingStartedAt ? Date.now() - state.recordingStartedAt : 0,
+    );
+
+    if (!autoLimit && (recordingMs < 450 || blob.size < 400)) {
+      showToast('Recording too short');
+      updateComposeState();
+      return;
+    }
+
+    composeBoxEl.classList.add('is-processing');
+    updateComposeState();
+    startMicTranscribeProgress(recordingMs, blob.size);
+
+    let transcript = '';
+    let transcribeOk = false;
+    try {
+      transcript = await fetchTranscriptFromAudio({ blob, mimeType });
+      transcribeOk = true;
+    } catch (err) {
+      showToast(err.message || 'Could not transcribe audio');
+      return;
+    } finally {
+      if (transcribeOk) {
+        if (transcribeProgressRaf) cancelAnimationFrame(transcribeProgressRaf);
+        transcribeProgressRaf = null;
+        updateMicTranscribeProgress(100);
+      }
+      stopMicTranscribeProgress();
+      composeBoxEl.classList.remove('is-processing');
+    }
+
+    if (!transcript.trim()) {
+      showToast('No speech detected — try again');
+      return;
+    }
+
+    appendToDraft(transcript);
+  } finally {
+    state.stoppingRecording = false;
+    updateComposeState();
   }
 }
 
@@ -1423,7 +2402,7 @@ async function waitForRecorderStop(mediaRecorder) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      setTimeout(resolve, 400);
+      setTimeout(resolve, RECORDER_STOP_FLUSH_MS);
     };
 
     const timeout = setTimeout(finish, 5000);
@@ -1445,93 +2424,6 @@ function buildRecordingBlob(mimeType) {
   return new Blob(state.audioChunks, { type: mimeType });
 }
 
-async function stopRecording({ autoLimit = false } = {}) {
-  if (state.stoppingRecording) return;
-  if (!state.isRecording && !state.mediaRecorder && !state.audioChunks.length) return;
-
-  state.stoppingRecording = true;
-  let retryPendingAfterStop = false;
-
-  try {
-    if (!autoLimit && state.isRecording) {
-      await sleep(RECORDING_TAIL_MS);
-    }
-
-    const mimeType = state.mediaRecorder?.mimeType || 'audio/webm';
-    const recorder = state.mediaRecorder;
-    const hasActiveRecorder = recorder && recorder.state !== 'inactive';
-    const hasCapturedAudio = state.audioChunks.length > 0
-      && (state.recordingStartedAt ? Date.now() - state.recordingStartedAt > 300 : true);
-
-    if (!hasActiveRecorder && !hasCapturedAudio) {
-      state.isRecording = false;
-      resetMicUI();
-      return;
-    }
-
-    state.isRecording = false;
-    state.isProcessing = true;
-    mainMicBtn.classList.remove('recording');
-    mainMicBtn.classList.add('processing');
-    mainMicBtn.setAttribute('aria-label', 'Translating…');
-    mainMicBtn.disabled = true;
-    liveTranscript.hidden = true;
-    stopRecordingProgress();
-
-    if (hasActiveRecorder) {
-      await waitForRecorderStop(recorder);
-      cleanupRecorder();
-    } else {
-      cleanupRecorder();
-    }
-
-    let blob = buildRecordingBlob(mimeType);
-    if (blob.size < 400) {
-      await sleep(300);
-      blob = buildRecordingBlob(mimeType);
-    }
-
-    const chunks = state.audioChunks;
-    state.audioChunks = [];
-
-    const elapsedMs = state.recordingStartedAt ? Date.now() - state.recordingStartedAt : 0;
-    const recordingMs = autoLimit
-      ? MAX_RECORDING_MS
-      : clampRecordingMs(elapsedMs);
-
-    if (!autoLimit && recordingMs < 450 && blob.size < 800) {
-      state.audioChunks = chunks;
-      showToast('Recording too short');
-      resetMicUI();
-      return;
-    }
-
-    if (blob.size < 400) {
-      showToast('Could not capture audio — tap and speak again');
-      resetMicUI();
-      return;
-    }
-
-    startProgress(estimateProcessingMs(recordingMs, blob.size));
-
-    try {
-      await sendRecordingForTranslation({ blob, mimeType, recordingMs });
-      await finishProgress();
-    } catch (err) {
-      if (err.retryable !== false) {
-        retryPendingAfterStop = true;
-      }
-    } finally {
-      resetMicUI();
-      if (retryPendingAfterStop) {
-        wakePendingQueue();
-      }
-    }
-  } finally {
-    state.stoppingRecording = false;
-  }
-}
-
 function cleanupRecorder() {
   state.mediaRecorder = null;
 }
@@ -1544,21 +2436,22 @@ function releaseMicTracks() {
 
 function releaseMic() {
   stopPlayback();
+  teardownMicMeter();
   releaseMicTracks();
 }
 
 function resetMicUI() {
   stopProgress();
+  stopMicTranscribeProgress();
+  stopLoadingDots();
   stopRecordingProgress();
-  releaseMicTracks();
+  cleanupRecorder();
   state.isProcessing = false;
   state.stoppingRecording = false;
-  mainMicBtn.classList.remove('processing');
+  state.isRecording = false;
+  setRecordingUI(false);
   clearProcessingVisuals();
-  liveTranscript.hidden = true;
-  liveTranscript.textContent = '';
-  updateProgressRing(0);
-  updateMicState();
+  updateComposeState();
 }
 
 async function playTranslation(msg, btn) {
@@ -1587,18 +2480,27 @@ async function playTranslation(msg, btn) {
   }
 }
 
+function renderTranslatedContent(msg) {
+  if (msg._streaming && msg._loading && !msg.translated) {
+    return `<span class="message-translated-text is-loading" aria-busy="true" aria-live="polite"><span class="translation-loading-brand"></span><span class="translation-loading-dots"></span></span>`;
+  }
+
+  const streamingClass = msg._streaming ? ' is-streaming' : '';
+  return `<span class="message-translated-text${streamingClass}">${escapeHtml(msg.translated)}</span>`;
+}
+
 function createMessageCard(msg) {
   const el = document.createElement('article');
   el.className = 'message-card message-card-current';
   el.dataset.messageId = String(msg.id);
+  const hideActions = msg._streaming;
 
   el.innerHTML = `
     <div class="message-bubble">
-      <div class="message-original">${escapeHtml(msg.original)}</div>
-      <div class="message-translated">
-        <span class="message-translated-text">${escapeHtml(msg.translated)}</span>
+      <div class="message-translated message-translated-only">
+        ${renderTranslatedContent(msg)}
       </div>
-      <div class="message-footer-actions">
+      <div class="message-footer-actions"${hideActions ? ' hidden' : ''}>
         <button type="button" class="icon-btn share-btn share-btn-inline" title="Share" aria-label="Share">
           ${SHARE_BTN_SVG}
         </button>
@@ -1640,6 +2542,7 @@ function createMessageCard(msg) {
 }
 
 function renderConversation() {
+  stopLoadingDots();
   currentMessageEl.innerHTML = '';
 
   if (!state.messages.length) {
@@ -1648,7 +2551,12 @@ function renderConversation() {
   }
 
   const latest = state.messages[state.messages.length - 1];
-  currentMessageEl.appendChild(createMessageCard(latest));
+  const card = createMessageCard(latest);
+  currentMessageEl.appendChild(card);
+
+  if (latest._loading) {
+    startLoadingDots(card.querySelector('.message-translated-text'), latest.original?.length || 0);
+  }
 }
 
 function showToast(message) {
@@ -1665,7 +2573,10 @@ function escapeHtml(str) {
 }
 
 function bindEvents() {
-  mainMicBtn.addEventListener('click', toggleRecording);
+  composeMicBtn.addEventListener('pointerdown', warmMicForRecording, { passive: true });
+  composeMicBtn.addEventListener('click', () => void beginRecording());
+  recordingCancelBtn.addEventListener('click', () => void cancelRecording());
+  recordingSendBtn.addEventListener('click', () => void acceptRecording());
   window.addEventListener('lingo:unauthorized', () => {
     if (authRequired) showAuthGate();
   });

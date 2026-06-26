@@ -10,11 +10,13 @@
     "build": "vite build",
     "start": "node server/index.js",
     "vercel-build": "vite build",
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "test:report": "playwright show-report",
     "preview": "vite preview"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "country-flag-icons": "^1.6.17",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "express-rate-limit": "^8.5.2",
@@ -22,6 +24,7 @@
     "openai": "^4.77.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "concurrently": "^9.1.2",
     "vite": "^6.0.7"
   }

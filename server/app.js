@@ -37,15 +37,50 @@ function getOpenAI() {
   return openaiClient;
 }
 
-function buildSystemPrompt(lang1, lang2) {
+function buildStreamingSystemPrompt(lang1, lang2) {
   const name1 = LANGUAGE_NAMES[lang1] || lang1;
   const name2 = LANGUAGE_NAMES[lang2] || lang2;
+  return `You translate between ${name1} and ${name2}. Detect which language the user wrote in, then output ONLY the translation in the other language. Never repeat the input. No quotes, labels, or JSON.`;
+}
 
-  return `Translate casual chat between ${name1} (${lang1}) and ${name2} (${lang2}) only.
+function buildTranslationUserMessage(text, lang1, lang2, context, detected) {
+  const trimmed = text.trim();
+  const source = detected || inferDetectedFromText(trimmed, lang1, lang2) || lang1;
+  const target = source === lang1 ? lang2 : lang1;
+  const fromName = LANGUAGE_NAMES[source] || source;
+  const toName = LANGUAGE_NAMES[target] || target;
+  const directive = `Translate from ${fromName} to ${toName}:\n${trimmed}`;
 
-Detect ${lang1} or ${lang2}. sourceText: light cleanup in the original language. translatedText: natural translation in the other language — stay close to the meaning. No trailing period.
+  const recentContext = context
+    .filter((m) => [lang1, lang2].includes(m.detectedLanguage))
+    .slice(-2)
+    .map((m) => `${m.detectedLanguage}: ${m.original} → ${m.translated}`)
+    .join('\n');
 
-JSON only: {"detectedLanguage":"${lang1}|${lang2}","sourceText":"...","translatedText":"...","targetLanguage":"${lang1}|${lang2}"}`;
+  return recentContext ? `${recentContext}\n\n${directive}` : directive;
+}
+
+function finalizeTranslation(rawText, translatedText, lang1, lang2, gptDetected = null, gptTarget = null) {
+  let detected = normalizeLangCode(gptDetected, lang1, lang2)
+    || inferDetectedFromText(rawText, lang1, lang2)
+    || normalizeLangCode(gptTarget, lang1, lang2)
+    || lang1;
+  const target = detected === lang1 ? lang2 : lang1;
+
+  const sourceText = stripTrailingPeriod(rawText.trim());
+  let translated = stripTrailingPeriod(translatedText || '');
+
+  const aligned = alignTranslationFields(sourceText, translated, detected, target);
+  translated = aligned.translatedText === sourceText && aligned.sourceText !== sourceText
+    ? aligned.sourceText
+    : aligned.translatedText;
+
+  return {
+    detectedLanguage: detected,
+    sourceText,
+    translatedText: translated,
+    targetLanguage: target,
+  };
 }
 
 function normalizeLangCode(value, lang1, lang2) {
@@ -212,62 +247,139 @@ function inferDetectedFromText(text, lang1, lang2) {
   return null;
 }
 
-async function translateText(openai, text, lang1, lang2, context) {
-  const recentContext = context
-    .filter((m) => [lang1, lang2].includes(m.detectedLanguage))
-    .slice(-2)
-    .map((m) => `${m.detectedLanguage}: ${m.original} → ${m.translated}`)
-    .join('\n');
+async function translateTextStream(openai, text, lang1, lang2, context, onDelta, { detected } = {}) {
+  const userMessage = buildTranslationUserMessage(text, lang1, lang2, context, detected);
 
-  const userMessage = recentContext
-    ? `${recentContext}\n\n${text.trim()}`
-    : text.trim();
-
-  const completion = await withRetry(() =>
+  const stream = await withRetry(() =>
     openai.chat.completions.create({
       model: 'gpt-4o-mini',
       temperature: 0.25,
       max_tokens: 180,
-      response_format: { type: 'json_object' },
+      stream: true,
       messages: [
-        { role: 'system', content: buildSystemPrompt(lang1, lang2) },
+        { role: 'system', content: buildStreamingSystemPrompt(lang1, lang2) },
         { role: 'user', content: userMessage },
       ],
     })
   );
 
-  const result = JSON.parse(completion.choices[0]?.message?.content || '{}');
+  for await (const chunk of stream) {
+    const delta = chunk.choices[0]?.delta?.content || '';
+    if (delta) onDelta(delta);
+  }
+}
 
-  let detected = normalizeLangCode(result.detectedLanguage, lang1, lang2)
-    || inferDetectedFromText(text, lang1, lang2)
-    || normalizeLangCode(result.targetLanguage, lang1, lang2)
-    || lang1;
-  const target = detected === lang1 ? lang2 : lang1;
+function beginTranslationStream(res) {
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-  let sourceText = stripTrailingPeriod(result.sourceText || text.trim());
-  let translatedText = stripTrailingPeriod(result.translatedText || '');
-
-  const aligned = alignTranslationFields(sourceText, translatedText, detected, target);
-  sourceText = aligned.sourceText;
-  translatedText = aligned.translatedText;
-
-  return {
-    detectedLanguage: detected,
-    sourceText,
-    translatedText,
-    targetLanguage: target,
+  return (obj) => {
+    res.write(`${JSON.stringify(obj)}\n`);
   };
 }
 
-async function transcribeAudio(openai, file) {
+async function pipeTranslationStream(res, openai, rawText, lang1, lang2, context) {
+  const writeLine = beginTranslationStream(res);
+  writeLine({ event: 'transcript', rawText });
+
+  const preDetected = inferDetectedFromText(rawText, lang1, lang2);
+
+  let accumulated = '';
+  await translateTextStream(openai, rawText, lang1, lang2, context, (chunk) => {
+    accumulated += chunk;
+    writeLine({ event: 'delta', text: chunk });
+  }, { detected: preDetected });
+
+  const translated = finalizeTranslation(rawText, accumulated, lang1, lang2, preDetected);
+
+  if (!translated.translatedText) {
+    writeLine({ event: 'error', error: 'Could not translate message' });
+    res.end();
+    return;
+  }
+
+  writeLine({ event: 'done', rawText, ...translated });
+  res.end();
+}
+
+function parseConversationContext(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
   try {
-    return await withRetry(() =>
-      openai.audio.transcriptions.create({ file, model: 'gpt-4o-mini-transcribe' })
-    );
+    return JSON.parse(value);
   } catch {
-    return await withRetry(() =>
-      openai.audio.transcriptions.create({ file, model: 'whisper-1' })
-    );
+    return [];
+  }
+}
+
+function validateLanguagePair(lang1, lang2, res) {
+  if (!lang1 || !lang2 || lang1 === lang2) {
+    res.status(400).json({ error: 'Select two different languages' });
+    return false;
+  }
+  if (!LANGUAGE_NAMES[lang1] || !LANGUAGE_NAMES[lang2]) {
+    res.status(400).json({ error: 'Invalid language selection' });
+    return false;
+  }
+  return true;
+}
+
+function isRetryableTranscribeFallback(err) {
+  const status = err?.status;
+  if (status === 400 || status === 401 || status === 403 || status === 413) return false;
+  if (status === 429) return false;
+  const code = err?.code || err?.error?.code;
+  if (code === 'insufficient_quota') return false;
+  const msg = String(err?.message || '').toLowerCase();
+  if (msg.includes('quota') || msg.includes('billing')) return false;
+  return true;
+}
+
+function buildTranscriptionPrompt(lang1, lang2) {
+  const name1 = LANGUAGE_NAMES[lang1];
+  const name2 = LANGUAGE_NAMES[lang2];
+  if (!name1 || !name2) return undefined;
+  return `The speaker may use ${name1} or ${name2}.`;
+}
+
+async function transcribeAudio(openai, file, { lang1, lang2 } = {}) {
+  const prompt = buildTranscriptionPrompt(lang1, lang2);
+  const primary = { file, model: 'gpt-4o-mini-transcribe' };
+  if (prompt) primary.prompt = prompt;
+
+  try {
+    return await withRetry(() => openai.audio.transcriptions.create(primary));
+  } catch (err) {
+    if (!isRetryableTranscribeFallback(err)) throw err;
+    const fallback = { file, model: 'whisper-1' };
+    if (prompt) fallback.prompt = prompt;
+    return await withRetry(() => openai.audio.transcriptions.create(fallback));
+  }
+}
+
+const ttsCache = new Map();
+const TTS_CACHE_MAX = 120;
+
+function ttsCacheKey(text, lang) {
+  return `${lang || ''}|${prepareTextForSpeech(text, lang)}`;
+}
+
+function readTtsCache(key) {
+  const hit = ttsCache.get(key);
+  if (!hit) return null;
+  ttsCache.delete(key);
+  ttsCache.set(key, hit);
+  return hit;
+}
+
+function writeTtsCache(key, buffer) {
+  if (ttsCache.has(key)) ttsCache.delete(key);
+  ttsCache.set(key, buffer);
+  while (ttsCache.size > TTS_CACHE_MAX) {
+    const oldest = ttsCache.keys().next().value;
+    ttsCache.delete(oldest);
   }
 }
 
@@ -276,6 +388,10 @@ async function generateSpeech(openai, text, lang) {
   if (!input) {
     throw new Error('No speakable text');
   }
+
+  const cacheKey = ttsCacheKey(input, lang);
+  const cached = readTtsCache(cacheKey);
+  if (cached) return cached;
 
   const speech = await withRetry(() =>
     openai.audio.speech.create({
@@ -287,7 +403,9 @@ async function generateSpeech(openai, text, lang) {
     }),
     2
   );
-  return Buffer.from(await speech.arrayBuffer());
+  const buffer = Buffer.from(await speech.arrayBuffer());
+  writeTtsCache(cacheKey, buffer);
+  return buffer;
 }
 
 function prepareTextForSpeech(text, lang) {
@@ -307,6 +425,7 @@ export function createApp() {
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/api/health', (_req, res) => {
+    res.set('Cache-Control', 'no-store');
     res.json({
       ok: true,
       authRequired: isAuthRequired(),
@@ -330,26 +449,14 @@ export function createApp() {
     res.json(getLanguagesList());
   });
 
-  app.post('/api/converse', requireAppAuth, converseRateLimit, upload.single('audio'), async (req, res) => {
+  app.post('/api/transcribe', requireAppAuth, converseRateLimit, upload.single('audio'), async (req, res) => {
     const openai = requireOpenAI(res);
     if (!openai) return;
 
     const lang1 = String(req.body.lang1 || '').toLowerCase().trim();
     const lang2 = String(req.body.lang2 || '').toLowerCase().trim();
-    let context = [];
 
-    try {
-      context = req.body.context ? JSON.parse(req.body.context) : [];
-    } catch {
-      context = [];
-    }
-
-    if (!lang1 || !lang2 || lang1 === lang2) {
-      return res.status(400).json({ error: 'Select two different languages' });
-    }
-    if (!LANGUAGE_NAMES[lang1] || !LANGUAGE_NAMES[lang2]) {
-      return res.status(400).json({ error: 'Invalid language selection' });
-    }
+    if (!validateLanguagePair(lang1, lang2, res)) return;
     if (!req.file?.buffer?.length) {
       return res.status(400).json({ error: 'No audio received' });
     }
@@ -359,23 +466,81 @@ export function createApp() {
 
     try {
       const file = await toFile(req.file.buffer, `audio.${ext}`, { type: mimeType });
-      const transcription = await transcribeAudio(openai, file);
+      const transcription = await transcribeAudio(openai, file, { lang1, lang2 });
       const rawText = transcription.text?.trim();
 
       if (!rawText) {
         return res.status(400).json({ error: 'No speech detected' });
       }
 
-      const translated = await translateText(openai, rawText, lang1, lang2, context);
+      res.json({ rawText });
+    } catch (err) {
+      console.error('Transcribe error:', err);
+      res.status(500).json({ error: formatApiError(err) });
+    }
+  });
 
-      if (!translated.translatedText) {
-        return res.status(500).json({ error: 'Could not translate message' });
+  app.post('/api/converse', requireAppAuth, converseRateLimit, upload.single('audio'), async (req, res) => {
+    const openai = requireOpenAI(res);
+    if (!openai) return;
+
+    const lang1 = String(req.body.lang1 || '').toLowerCase().trim();
+    const lang2 = String(req.body.lang2 || '').toLowerCase().trim();
+    const context = parseConversationContext(req.body.context);
+
+    if (!validateLanguagePair(lang1, lang2, res)) return;
+    if (!req.file?.buffer?.length) {
+      return res.status(400).json({ error: 'No audio received' });
+    }
+
+    const mimeType = req.file.mimetype || 'audio/webm';
+    const ext = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('ogg') ? 'ogg' : 'webm';
+
+    try {
+      const file = await toFile(req.file.buffer, `audio.${ext}`, { type: mimeType });
+      const transcription = await transcribeAudio(openai, file, { lang1, lang2 });
+      const rawText = transcription.text?.trim();
+
+      if (!rawText) {
+        return res.status(400).json({ error: 'No speech detected' });
       }
 
-      res.json({ rawText, ...translated });
+      await pipeTranslationStream(res, openai, rawText, lang1, lang2, context);
     } catch (err) {
       console.error('Converse error:', err);
-      res.status(500).json({ error: formatApiError(err) });
+      if (res.headersSent) {
+        res.write(`${JSON.stringify({ event: 'error', error: formatApiError(err) })}\n`);
+        res.end();
+      } else {
+        res.status(500).json({ error: formatApiError(err) });
+      }
+    }
+  });
+
+  app.post('/api/translate', requireAppAuth, converseRateLimit, async (req, res) => {
+    const openai = requireOpenAI(res);
+    if (!openai) return;
+
+    const lang1 = String(req.body.lang1 || '').toLowerCase().trim();
+    const lang2 = String(req.body.lang2 || '').toLowerCase().trim();
+    const context = parseConversationContext(req.body.context);
+    const rawText = String(req.body.text || '').trim();
+
+    if (!validateLanguagePair(lang1, lang2, res)) return;
+    if (!rawText) {
+      return res.status(400).json({ error: 'Text is required' });
+    }
+
+    try {
+      await pipeTranslationStream(res, openai, rawText, lang1, lang2, context);
+    } catch (err) {
+      console.error('Translate error:', err);
+      if (res.headersSent) {
+        res.write(`${JSON.stringify({ event: 'error', error: formatApiError(err) })}\n`);
+        res.end();
+      } else {
+        res.status(500).json({ error: formatApiError(err) });
+      }
     }
   });
 
