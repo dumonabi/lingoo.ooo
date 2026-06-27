@@ -2613,7 +2613,7 @@ function createMessageCard(msg) {
           ${SHARE_BTN_SVG}
         </button>
         <div class="message-actions-listen"${msg.audioUrl ? '' : ' hidden'}>
-          <button type="button" class="icon-btn listen-btn listen-btn-inline" title="Listen" aria-label="Listen">
+          <button type="button" class="icon-btn listen-btn" title="Listen" aria-label="Listen">
             ${LISTEN_BTN_SVG}
           </button>
         </div>
