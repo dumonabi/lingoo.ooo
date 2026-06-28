@@ -1,4 +1,5 @@
-import { createLangPicker } from './lang-picker.js';
+import { createLangPicker, hideAllLangPickerCarets } from './lang-picker.js';
+import { createTypingCaret, measureCharCell, positionBlockCaret } from './caret-style.js';
 import { CHAMELEON_LOGO_SVG } from './chameleon-logo.js';
 import { apiFetch, clearAuthToken, fetchCurrentUser, getAuthToken, setAuthToken, setStoredUser } from './auth.js';
 import { initUserProfile, refreshUserSession } from './user-profile.js';
@@ -81,11 +82,8 @@ const composeInputWrapEl = $('#compose-input-wrap');
 const composeCaretEl = $('#compose-caret');
 const dictationTranslateBtn = $('#dictation-translate');
 
-const LOADING_BRAND_TEXT = 'lingu.ooo';
-const LOADING_LETTER_MS = 100;
 const LOADING_DOT_MS = 500;
 const LOADING_DOT_MAX = 20;
-let loadingLetterTimer = null;
 let loadingDotsTimer = null;
 
 let composeCaretMirrorEl = null;
@@ -134,7 +132,6 @@ const COPY_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 
 const SHARE_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z"/></svg>';
 const LISTEN_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>';
 const SHARE_AUDIO_BTN_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 10v4h2l3.5 3.5V6.5L6 10H4z" fill="currentColor" stroke="none"/><path d="M13 12h7"/><path d="M17 8l4 4-4 4"/></svg>';
-const WAND_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7.5 5.6L5 7l1.4-2.5L5 2l2.5 1.4L10 2 8.6 4.5 10 7 7.5 5.6zm12 9.8l-1.4 2.5 2.5-1.4 2.5 1.4-1.4-2.5 1.4-2.5-2.5 1.4-2.5-1.4 1.4 2.5zM6 19l11.7-11.7 2.3 2.3L8.3 21 6 19z"/></svg>';
 
 function prefetchAudio(msg) {
   return loadMessageAudio(msg, { prefetch: true });
@@ -142,10 +139,9 @@ function prefetchAudio(msg) {
 
 function speakModeForMessage(msg) {
   const lang = msg.targetLanguage;
-  if (!lang) return 'default';
+  if (!lang || !state.user?.voiceReady) return 'default';
   const code = lang === 'nn' ? 'no' : lang;
   if (!cloneVoiceLanguages.has(code)) return 'default';
-  if (!state.user?.voiceReady) return 'default';
   return 'clone';
 }
 
@@ -202,48 +198,6 @@ function invalidateMessageAudio(msg) {
   msg._audioPromise = null;
 }
 
-function inferMessageTargetLanguage(msg) {
-  if (msg.targetLanguage) return msg.targetLanguage;
-  const { lang1, lang2 } = getLanguagePair();
-  const detected = msg.detectedLanguage;
-  if (detected === lang1) return lang2;
-  if (detected === lang2) return lang1;
-  return null;
-}
-
-function invalidateMessageDub(msg) {
-  if (msg.dubAudioUrl) {
-    URL.revokeObjectURL(msg.dubAudioUrl);
-    msg.dubAudioUrl = null;
-  }
-}
-
-function stopDubCountdown(msg) {
-  if (msg._dubTickTimer) {
-    clearInterval(msg._dubTickTimer);
-    msg._dubTickTimer = null;
-  }
-}
-
-function dubStatusText(msg) {
-  if (msg.dubStatus !== 'loading') return '';
-  return 'Creating audio with your voice… a few seconds';
-}
-
-function startDubCountdown(msg) {
-  stopDubCountdown(msg);
-  msg._dubTickTimer = null;
-}
-
-function cancelMessageDub(msg) {
-  if (msg._dubPollAbort) {
-    msg._dubPollAbort.abort();
-    msg._dubPollAbort = null;
-  }
-  stopDubCountdown(msg);
-  invalidateMessageDub(msg);
-}
-
 function stopPlayback() {
   playbackEpoch++;
   const audio = state.currentAudio;
@@ -268,7 +222,6 @@ function prepareForNewTranslation(message) {
   for (const m of state.messages) {
     if (m.id !== message.id) {
       cancelMessageAudio(m);
-      cancelMessageDub(m);
     }
   }
 }
@@ -604,7 +557,6 @@ async function shareTranslation(text, btn) {
 }
 
 async function init() {
-  $('#logo-icon').innerHTML = CHAMELEON_LOGO_SVG;
   $('#auth-logo').innerHTML = CHAMELEON_LOGO_SVG;
 
   const ready = await checkHealth();
@@ -745,7 +697,8 @@ function initPickers() {
   picker1 = createLangPicker($('#lang-picker-1'), {
     languages: state.languages,
     value: state.lang1,
-    placeholder: 'Language',
+    placeholder: '',
+    onFocusEdit: syncComposeCaret,
     onChange: (code) => {
       state.lang1 = code;
       if (state.lang1 === state.lang2) {
@@ -760,7 +713,8 @@ function initPickers() {
   picker2 = createLangPicker($('#lang-picker-2'), {
     languages: state.languages,
     value: state.lang2,
-    placeholder: 'Language',
+    placeholder: '',
+    onFocusEdit: syncComposeCaret,
     onChange: (code) => {
       state.lang2 = code;
       if (state.lang1 === state.lang2) {
@@ -1033,10 +987,15 @@ function updateComposeState() {
   const recordingUi = isRecordingUiActive();
   const busy = recordingUi || state.isRecording || state.isProcessing || state.stoppingRecording;
   const hasText = Boolean(getDraftText());
+  const canUseDraftActions = hasText && !busy;
+
   composeMicBtn.disabled = !ready || busy;
-  composeNewBtn.disabled = busy || !hasText;
-  dictationTranslateBtn.disabled = busy || !hasText;
-  dictationTranslateBtn.classList.toggle('is-ready', hasText && !busy);
+  composeNewBtn.hidden = !canUseDraftActions;
+  composeNewBtn.disabled = !canUseDraftActions;
+  dictationTranslateBtn.hidden = !canUseDraftActions;
+  dictationTranslateBtn.disabled = !canUseDraftActions;
+  dictationTranslateBtn.classList.toggle('is-ready', canUseDraftActions);
+  composeBoxEl?.classList.toggle('has-draft-actions', canUseDraftActions);
   recordingCancelBtn.disabled = state.stoppingRecording;
   recordingSendBtn.disabled = !state.isRecording || state.stoppingRecording;
   dictationInputEl.disabled = recordingUi || state.isRecording || state.isProcessing;
@@ -1072,6 +1031,19 @@ function resizeDictationInput() {
   syncComposeCaret();
 }
 
+let composeCaretTyping = null;
+
+function getComposeCaretTyping() {
+  if (!composeCaretTyping && composeCaretEl) {
+    composeCaretTyping = createTypingCaret(composeCaretEl);
+  }
+  return composeCaretTyping;
+}
+
+function pulseComposeCaretTyping() {
+  getComposeCaretTyping()?.pulse();
+}
+
 function ensureComposeCaretMirror() {
   if (composeCaretMirrorEl || !composeInputWrapEl) return composeCaretMirrorEl;
   composeCaretMirrorEl = document.createElement('div');
@@ -1093,8 +1065,9 @@ function syncComposeCaret() {
   wrap.classList.toggle('is-focused', focused);
   wrap.classList.toggle('is-empty', !ta.value);
 
-  if (recording || ta.disabled) {
+  if (recording || ta.disabled || !focused) {
     caret.hidden = true;
+    getComposeCaretTyping()?.reset();
     return;
   }
 
@@ -1126,11 +1099,14 @@ function syncComposeCaret() {
 
   const markerRect = marker.getBoundingClientRect();
   const wrapRect = wrap.getBoundingClientRect();
-  const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.45;
+  const { charWidth, lineHeight } = measureCharCell(mirror, style);
 
-  caret.style.left = `${markerRect.left - wrapRect.left}px`;
-  caret.style.top = `${markerRect.top - wrapRect.top + ta.scrollTop}px`;
-  caret.style.height = `${lineHeight}px`;
+  positionBlockCaret(caret, {
+    left: markerRect.left - wrapRect.left,
+    top: markerRect.top - wrapRect.top + ta.scrollTop,
+    charWidth,
+    lineHeight,
+  });
 }
 
 function shouldRefocusComposeInput(next) {
@@ -1220,8 +1196,13 @@ function bindDictation() {
     syncDraftTranslationPrefetch();
     resizeDictationInput();
     updateComposeState();
+    pulseComposeCaretTyping();
   });
-  dictationInputEl.addEventListener('focus', syncComposeCaret);
+  dictationInputEl.addEventListener('focus', () => {
+    hideAllLangPickerCarets();
+    syncComposeCaret();
+  });
+  dictationInputEl.addEventListener('blur', syncComposeCaret);
   dictationInputEl.addEventListener('blur', (e) => {
     if (shouldRefocusComposeInput(e.relatedTarget)) {
       requestAnimationFrame(() => focusComposeInput());
@@ -1229,8 +1210,12 @@ function bindDictation() {
     }
     requestAnimationFrame(syncComposeCaret);
   });
+  dictationInputEl.addEventListener('keydown', pulseComposeCaretTyping);
   dictationInputEl.addEventListener('keyup', syncComposeCaret);
-  dictationInputEl.addEventListener('click', syncComposeCaret);
+  dictationInputEl.addEventListener('click', () => {
+    pulseComposeCaretTyping();
+    syncComposeCaret();
+  });
   dictationInputEl.addEventListener('touchend', () => {
     requestAnimationFrame(syncComposeCaret);
   }, { passive: true });
@@ -1868,13 +1853,6 @@ async function applyTranslationResult(data, { requestId, prefetchEntry, sourceRe
           recordingMs: attachedRecording.recordingMs,
         }
       : null,
-    dubStatus: null,
-    dubEstimateSec: null,
-    dubStartedAt: null,
-    dubAudioUrl: null,
-    dubId: null,
-    dubTargetLang: null,
-    dubError: null,
   };
 
   if (attachedRecording && !sourceRecording) {
@@ -1898,7 +1876,6 @@ async function applyTranslationResult(data, { requestId, prefetchEntry, sourceRe
   for (const m of state.messages) {
     if (m.id !== message.id) {
       cancelMessageAudio(m);
-      cancelMessageDub(m);
     }
   }
 
@@ -1938,52 +1915,29 @@ function maxLoadingDots(textLength) {
 }
 
 function stopLoadingDots() {
-  if (loadingLetterTimer) clearInterval(loadingLetterTimer);
-  loadingLetterTimer = null;
   if (loadingDotsTimer) clearInterval(loadingDotsTimer);
   loadingDotsTimer = null;
 }
 
 function startLoadingDots(hostEl, textLength) {
   stopLoadingDots();
-  const brandEl = hostEl?.querySelector('.translation-loading-brand');
   const dotsEl = hostEl?.querySelector('.translation-loading-dots');
-  if (!brandEl || !dotsEl) return;
+  if (!dotsEl) return;
 
   const cap = maxLoadingDots(textLength);
-  let letterIndex = 0;
   let dotCount = 0;
-
-  brandEl.textContent = '';
   dotsEl.textContent = '';
 
-  loadingLetterTimer = window.setInterval(() => {
+  loadingDotsTimer = window.setInterval(() => {
     const message = state.messages[0];
     if (!message?._loading) {
       stopLoadingDots();
       return;
     }
-
-    if (letterIndex < LOADING_BRAND_TEXT.length) {
-      letterIndex += 1;
-      brandEl.textContent = LOADING_BRAND_TEXT.slice(0, letterIndex);
-      if (letterIndex < LOADING_BRAND_TEXT.length) return;
-
-      clearInterval(loadingLetterTimer);
-      loadingLetterTimer = null;
-
-      loadingDotsTimer = window.setInterval(() => {
-        const active = state.messages[0];
-        if (!active?._loading) {
-          stopLoadingDots();
-          return;
-        }
-        if (dotCount >= cap) return;
-        dotCount += 1;
-        dotsEl.textContent += '.';
-      }, LOADING_DOT_MS);
-    }
-  }, LOADING_LETTER_MS);
+    if (dotCount >= cap) return;
+    dotCount += 1;
+    dotsEl.textContent += '.';
+  }, LOADING_DOT_MS);
 }
 
 function showStreamingTranscript(rawText, requestId) {
@@ -2774,188 +2728,9 @@ async function shareClonedAudio(msg, btn) {
   }
 }
 
-function renderDubPanel(msg) {
-  if (msg.dubStatus === 'loading') {
-    return `
-      <div class="message-dub-panel is-loading" aria-busy="true" aria-live="polite">
-        <p class="message-dub-label">Your voice</p>
-        <p class="message-dub-status">${escapeHtml(dubStatusText(msg))}</p>
-      </div>
-    `;
-  }
-
-  if (msg.dubStatus === 'ready' && msg.dubAudioUrl) {
-    return `
-      <div class="message-dub-panel is-ready">
-        <p class="message-dub-label">Your voice</p>
-        <div class="message-dub-actions">
-          <button type="button" class="icon-btn dub-listen-btn" title="Listen" aria-label="Listen to your voice">
-            ${LISTEN_BTN_SVG}
-          </button>
-          <button type="button" class="icon-btn dub-share-btn" title="Share audio" aria-label="Share your voice audio">
-            ${SHARE_AUDIO_BTN_SVG}
-          </button>
-        </div>
-      </div>
-    `;
-  }
-
-  if (msg.dubStatus === 'error') {
-    return `
-      <div class="message-dub-panel is-error" role="alert">
-        <p class="message-dub-label">Your voice</p>
-        <p class="message-dub-error">${escapeHtml(msg.dubError || 'Could not create audio — try again')}</p>
-      </div>
-    `;
-  }
-
-  return '';
-}
-
-function showDubWand(msg) {
-  if (msg._loading || msg._streaming) return false;
-  if (msg.dubStatus === 'ready') return false;
-  if (!msg.translated?.trim()) return false;
-  return Boolean(resolveSourceRecording(msg)?.blob);
-}
-
-function resolveSourceRecording(msg) {
-  if (msg.sourceRecording?.blob) return msg.sourceRecording;
-  if (pendingSourceRecording?.blob) {
-    msg.sourceRecording = {
-      blob: pendingSourceRecording.blob,
-      mimeType: pendingSourceRecording.mimeType,
-      recordingMs: pendingSourceRecording.recordingMs,
-    };
-  }
-  return msg.sourceRecording;
-}
-
-async function startOptionalDubbing(msg, wandBtn) {
-  if (msg.dubStatus === 'loading') return;
-  if (wandBtn?.dataset.busy === '1') return;
-
-  if (!msg.translated?.trim()) {
-    showToast('Translation still loading — try again in a moment');
-    return;
-  }
-
-  cancelMessageDub(msg);
-  msg.dubStatus = 'loading';
-  msg.dubError = null;
-  msg.dubAudioUrl = null;
-
-  if (wandBtn) {
-    wandBtn.dataset.busy = '1';
-    wandBtn.disabled = true;
-    wandBtn.classList.add('is-loading');
-  }
-
-  renderConversation();
-
-  const controller = new AbortController();
-  msg._dubPollAbort = controller;
-
-  try {
-    const targetLang = inferMessageTargetLanguage(msg);
-    const res = await apiFetch('/api/dub/render', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        text: msg.translated,
-        lang: targetLang,
-        voiceMode: speakModeForMessage(msg),
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      throw new Error(data.error || 'Could not create audio');
-    }
-
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.includes('audio')) {
-      throw new Error('Could not create audio');
-    }
-
-    const blob = await res.blob();
-    if (!blob.size) throw new Error('Audio was empty');
-
-    msg.dubAudioUrl = URL.createObjectURL(blob);
-    msg.dubStatus = 'ready';
-  } catch (err) {
-    if (err?.name === 'AbortError') return;
-    msg.dubStatus = 'error';
-    msg.dubError = err.message || 'Could not create audio';
-    showToast(msg.dubError);
-  } finally {
-    stopDubCountdown(msg);
-    msg._dubPollAbort = null;
-    if (msg.id === state.latestMessageId) renderConversation();
-  }
-}
-
-async function playDubAudio(msg, btn) {
-  if (btn?.dataset.busy === '1') return;
-
-  releaseActionButtonFocus(btn?.closest('.message-card')?.querySelector('.copy-btn, .share-btn'));
-  if (btn) btn.dataset.busy = '1';
-  stopPlayback();
-
-  btn?.classList.add('playing');
-  if (btn) btn.disabled = true;
-
-  try {
-    if (!msg.dubAudioUrl) throw new Error('Dubbed audio not ready');
-    await playAudioUrl(msg.dubAudioUrl);
-  } catch (err) {
-    if (err?.name !== 'AbortError') showToast(err.message);
-  } finally {
-    if (btn) resetListenBtn(btn);
-  }
-}
-
-async function shareDubAudio(msg, btn) {
-  if (btn?.dataset.busy === '1') return;
-  if (btn) {
-    btn.dataset.busy = '1';
-    btn.disabled = true;
-  }
-
-  try {
-    if (!msg.dubAudioUrl) throw new Error('Dubbed audio not ready');
-
-    const blob = await blobFromAudioUrl(msg.dubAudioUrl);
-    const filename = `lingu-dub-${Date.now()}.mp3`;
-    const file = new File([blob], filename, { type: blob.type || 'audio/mpeg' });
-
-    if (typeof navigator.share !== 'function') {
-      showToast('Sharing audio is not supported on this device');
-      return;
-    }
-    if (navigator.canShare && !navigator.canShare({ files: [file] })) {
-      showToast('Sharing audio is not supported on this device');
-      return;
-    }
-
-    await navigator.share({ files: [file], title: 'Natural delivery audio' });
-  } catch (err) {
-    if (err?.name !== 'AbortError') {
-      showToast(err.message || 'Could not share audio');
-    }
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      delete btn.dataset.busy;
-      releaseActionButtonFocus(btn);
-    }
-  }
-}
-
 function renderTranslatedContent(msg) {
   if (msg._streaming && msg._loading && !msg.translated) {
-    return `<span class="message-translated-text is-loading" aria-busy="true" aria-live="polite"><span class="translation-loading-brand"></span><span class="translation-loading-dots"></span></span>`;
+    return `<span class="message-translated-text is-loading" aria-busy="true" aria-live="polite"><span class="translation-loading-dots"></span></span>`;
   }
 
   const streamingClass = msg._streaming ? ' is-streaming' : '';
@@ -2967,8 +2742,6 @@ function createMessageCard(msg) {
   el.className = 'message-card message-card-current';
   el.dataset.messageId = String(msg.id);
   const hideActions = msg._streaming || msg._loading;
-  const dubPanelHtml = renderDubPanel(msg);
-  const wandVisible = showDubWand(msg);
 
   el.innerHTML = `
     <div class="message-bubble">
@@ -2992,12 +2765,6 @@ function createMessageCard(msg) {
         </button>
       </div>
     </div>
-    ${dubPanelHtml}
-    <div class="message-voice-tools"${wandVisible ? '' : ' hidden'}>
-      <button type="button" class="message-voice-wand${msg.dubStatus === 'loading' ? ' is-loading' : ''}" title="Generate audio with your voice profile" aria-label="Generate audio with your voice profile"${msg.dubStatus === 'loading' ? ' disabled aria-busy="true"' : ''}>
-        ${WAND_BTN_SVG}
-      </button>
-    </div>
   `;
 
   if (msg.audioUrl) {
@@ -3012,15 +2779,6 @@ function createMessageCard(msg) {
 
   listenBtn?.addEventListener('click', () => playTranslation(msg, listenBtn));
   shareAudioBtn?.addEventListener('click', () => void shareClonedAudio(msg, shareAudioBtn));
-  el.querySelector('.dub-listen-btn')?.addEventListener('click', (event) => {
-    playDubAudio(msg, event.currentTarget);
-  });
-  el.querySelector('.dub-share-btn')?.addEventListener('click', (event) => {
-    void shareDubAudio(msg, event.currentTarget);
-  });
-  el.querySelector('.message-voice-wand')?.addEventListener('click', (event) => {
-    void startOptionalDubbing(msg, event.currentTarget);
-  });
   copyBtn?.addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText(msg.translated);
@@ -3051,10 +2809,6 @@ function renderConversation() {
 
   if (latest._loading) {
     startLoadingDots(card.querySelector('.message-translated-text'), latest.original?.length || 0);
-  }
-
-  if (latest.dubStatus === 'loading') {
-    startDubCountdown(latest);
   }
 }
 

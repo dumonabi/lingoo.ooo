@@ -7,7 +7,7 @@ async function prepareApp(page, apiOptions = {}) {
   await page.addInitScript(MEDIA_MOCK_INIT_SCRIPT);
   await setupApiMocks(page, apiOptions);
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Lingu.ooo', level: 1 })).toBeVisible();
+  await expect(page.locator('#compose-mic')).toBeVisible();
 }
 
 async function recordOnce(page, { holdMs = 550, translate = true } = {}) {
@@ -167,9 +167,10 @@ test.describe('Lingu.ooo', () => {
       localStorage.setItem('lingo-languages', JSON.stringify({ lang1: 'es', lang2: 'th' }));
     });
     await page.reload();
-    await expect(page.getByRole('heading', { name: 'Lingu.ooo', level: 1 })).toBeVisible();
+    await expect(page.locator('#dictation-translate')).toBeHidden();
 
     await page.locator('#dictation-input').fill('hola');
+    await expect(page.locator('#dictation-translate')).toBeVisible();
     await expect(page.locator('#dictation-translate')).toBeEnabled();
     await page.locator('#dictation-translate').click();
     await expect(page.locator('.message-translated-text')).toHaveText('สวัสดี', { timeout: 8000 });

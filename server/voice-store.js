@@ -119,6 +119,24 @@ export async function deleteVoiceSample(userId, sampleId) {
   return profile;
 }
 
+export async function clearAllVoiceSamples(userId) {
+  const profile = await getVoiceProfile(userId);
+
+  for (const sample of profile.samples) {
+    try {
+      await fs.unlink(path.join(samplesDir(userId), `${sample.id}.${sample.ext}`));
+    } catch {
+      // ignore missing file
+    }
+  }
+
+  profile.samples = [];
+  profile.elevenlabsVoiceId = null;
+  profile.status = 'none';
+  await writeMeta(userId, profile);
+  return profile;
+}
+
 export async function saveVoiceClone(userId, elevenlabsVoiceId) {
   const profile = await getVoiceProfile(userId);
   profile.elevenlabsVoiceId = elevenlabsVoiceId;

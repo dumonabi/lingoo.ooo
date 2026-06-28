@@ -30,7 +30,6 @@ export async function setupApiMocks(page, options = {}) {
         body: JSON.stringify({
           ok: true,
           authRequired,
-          dubbingConfigured: false,
           cloneVoiceLanguages: ['en', 'es', 'fr', 'de', 'ja', 'zh', 'it', 'pt'],
         }),
       });

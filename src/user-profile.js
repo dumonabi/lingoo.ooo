@@ -3,6 +3,29 @@ import { getVoicePrompt, getVoiceUi, VOICE_SAMPLE_TARGET } from './voice-prompts
 
 const MIN_SAMPLES = VOICE_SAMPLE_TARGET;
 
+const USER_PROFILE_TRIGGER_ICON = `
+  <span class="user-profile-trigger-icon" aria-hidden="true">
+    <svg class="user-profile-user-icon" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
+    </svg>
+    <span class="user-profile-badge user-profile-badge--plus">
+      <svg viewBox="0 0 10 10" fill="none" aria-hidden="true">
+        <path d="M5 1.5v7M1.5 5h7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+    </span>
+    <span class="user-profile-badge user-profile-badge--check">
+      <svg viewBox="0 0 10 10" fill="none" aria-hidden="true">
+        <path d="M1.75 5.25 4 7.5 8.25 2.75" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </span>
+    <span class="user-profile-badge user-profile-badge--close">
+      <svg viewBox="0 0 10 10" fill="none" aria-hidden="true">
+        <path d="M2 5h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+    </span>
+  </span>
+`;
+
 let rootEl = null;
 let menuOpen = false;
 let voiceProfile = null;
@@ -122,6 +145,11 @@ function renderMenuContent() {
   const showRecord = canRecordMore && !isRecording && !creatingVoice && !savingSample;
   const showUpdate = samplesComplete && voiceReady && status === 'needs_update' && !creatingVoice && !savingSample;
   const showSetup = samplesComplete && !voiceReady && elevenlabsConfigured && !creatingVoice && !isRecording && !savingSample;
+  const samples = voiceProfile?.samples || [];
+  const lastSample = samples.length ? samples[samples.length - 1] : null;
+  const showLastSample = samplesComplete && lastSample && !savingSample && !isRecording && !creatingVoice;
+  const showRecordAgain = samplesComplete && !isRecording && !savingSample && !creatingVoice;
+  const busy = isRecording || savingSample || creatingVoice;
 
   panel.innerHTML = `
     <div class="user-profile-header">
@@ -135,7 +163,7 @@ function renderMenuContent() {
     <div class="user-profile-section">
       <p class="user-profile-label">${ui.voiceProfile}</p>
       <p class="user-profile-copy">${ui.voiceCopy}</p>
-      <p class="user-profile-count">${Math.min(sampleCount, maxSamples)}/${maxSamples} ${ui.samplesRecorded}</p>
+      <p class="user-profile-count">${Math.min(sampleCount, maxSamples)}/${maxSamples}</p>
       ${status === 'needs_update' ? `<p class="user-profile-note">${ui.needsUpdate}</p>` : ''}
       ${creatingVoice ? `<p class="user-profile-note user-profile-note--active">${ui.creatingVoice}</p>` : ''}
       ${savingSample ? `<p class="user-profile-note user-profile-note--active">${ui.savingSample}</p>` : ''}
@@ -145,24 +173,21 @@ function renderMenuContent() {
       ${recordingAtLimit ? `<p class="user-profile-note">${ui.recordingBlocked}</p>` : ''}
     </div>
 
-    <div class="user-profile-samples"${sampleCount ? '' : ' hidden'}>
-      <p class="user-profile-label">${ui.savedSamples}</p>
-      <ul class="user-profile-sample-list" id="user-voice-sample-list">
-        ${(voiceProfile?.samples || []).map((sample, index) => `
-          <li>
-            <span>${ui.sampleLabel} ${index + 1}</span>
-            <button type="button" class="user-profile-delete-btn" data-sample-id="${escapeHtml(sample.id)}" aria-label="${ui.deleteSample} ${index + 1}"${isRecording || creatingVoice ? ' disabled' : ''}>${ui.deleteSample}</button>
-          </li>
-        `).join('')}
-      </ul>
+    ${showLastSample ? `
+    <div class="user-profile-samples">
+      <div class="user-profile-sample-row">
+        <span class="user-profile-sample-count">${maxSamples}/${maxSamples} ${ui.samplesRecorded}</span>
+        <button type="button" class="user-profile-delete-btn" data-sample-id="${escapeHtml(lastSample.id)}" aria-label="${ui.deleteSample}"${busy ? ' disabled' : ''}>${ui.deleteSample}</button>
+      </div>
     </div>
+    ` : ''}
 
     ${showRecord || (isRecording && !recordingAtLimit) ? `
     <div class="user-profile-prompt${isRecording ? ' is-recording' : ''}">
       <p class="user-profile-label">${isRecording ? ui.readingNow : ui.readNext}</p>
       <p class="user-profile-prompt-text">"${escapeHtml(prompt)}"</p>
     </div>
-    ` : samplesComplete && !isRecording ? `<p class="user-profile-note user-profile-note--success">${ui.enoughSamples}</p>` : ''}
+    ` : ''}
 
     <div class="user-profile-actions">
       <button type="button" class="user-profile-record-btn" id="user-voice-record-btn"${showRecord ? '' : ' hidden'}>
@@ -185,7 +210,12 @@ function renderMenuContent() {
       </button>
     </div>
 
-    <button type="button" class="user-profile-signout" id="user-profile-signout">${ui.switchUser}</button>
+    <div class="user-profile-footer">
+      ${showRecordAgain ? `
+      <button type="button" class="user-profile-record-again" id="user-profile-record-again"${busy ? ' disabled' : ''}>${ui.recordAgain}</button>
+      ` : ''}
+      <button type="button" class="user-profile-signout" id="user-profile-signout">${ui.switchUser}</button>
+    </div>
   `;
 
   $('#user-voice-record-btn', panel)?.addEventListener('click', () => void startVoiceSampleRecording());
@@ -193,6 +223,7 @@ function renderMenuContent() {
   $('#user-voice-cancel-btn', panel)?.addEventListener('click', () => cancelVoiceSampleRecording());
   $('#user-voice-setup-btn', panel)?.addEventListener('click', () => void createVoiceProfile(false));
   $('#user-voice-update-btn', panel)?.addEventListener('click', () => void createVoiceProfile(true));
+  $('#user-profile-record-again', panel)?.addEventListener('click', () => void resetAllVoiceSamples());
   $('#user-profile-signout', panel)?.addEventListener('click', () => signOut());
   panel.querySelectorAll('[data-sample-id]').forEach((btn) => {
     btn.addEventListener('click', () => void deleteVoiceSample(btn.dataset.sampleId));
@@ -207,13 +238,29 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
+function getTriggerVisualState(user) {
+  if (menuOpen) return 'open';
+  const { samplesComplete, voiceReady } = getProfileState(user);
+  if (voiceReady || samplesComplete) return 'ready';
+  return 'setup';
+}
+
 function updateTrigger() {
   const user = getStoredUser();
   const trigger = $('#user-profile-trigger', rootEl);
   if (!trigger) return;
-  trigger.textContent = initials(user?.name || '?');
-  trigger.title = user?.name ? `${user.name} profile` : 'User profile';
-  trigger.setAttribute('aria-label', user?.name ? `${user.name} profile` : 'User profile');
+
+  const visual = getTriggerVisualState(user);
+  trigger.dataset.visual = visual;
+
+  const name = user?.name?.trim() || 'User';
+  const labels = {
+    open: `Close ${name} profile`,
+    ready: `${name} profile — voice ready`,
+    setup: `${name} profile — add voice samples`,
+  };
+  trigger.title = labels[visual];
+  trigger.setAttribute('aria-label', labels[visual]);
 }
 
 function setMenuOpen(open) {
@@ -223,6 +270,7 @@ function setMenuOpen(open) {
   const panel = $('#user-profile-panel', rootEl);
   trigger?.setAttribute('aria-expanded', open ? 'true' : 'false');
   if (panel) panel.hidden = !open;
+  updateTrigger();
 }
 
 async function refreshVoiceProfile() {
@@ -231,13 +279,14 @@ async function refreshVoiceProfile() {
   voiceProfile = await res.json();
 
   const user = getStoredUser();
-  const { maxSamples } = getProfileState(user);
+  const state = getProfileState(user);
   if (!state.canRecordMore && recordingSession) {
     discardActiveRecording();
-    toast(`Extra recording discarded — you already have ${maxSamples} samples`);
+    toast(`Extra recording discarded — you already have ${state.maxSamples} samples`);
   }
 
   renderMenuContent();
+  updateTrigger();
   await maybeEnsureVoiceConfigured();
 }
 
@@ -381,6 +430,24 @@ async function deleteVoiceSample(sampleId) {
   await refreshUserSession();
 }
 
+async function resetAllVoiceSamples() {
+  if (recordingSession || savingSample || creatingVoice) return;
+
+  const user = getStoredUser();
+  const ui = getVoiceUi(user?.nativeLanguage);
+  if (!window.confirm(ui.confirmRecordAgain)) return;
+
+  voiceSetupError = '';
+  const res = await apiFetch('/api/voice/samples', { method: 'DELETE' });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    toast(data.error || 'Could not reset samples');
+    return;
+  }
+  toast(ui.recordAgain);
+  await refreshUserSession();
+}
+
 async function createVoiceProfile(isUpdate) {
   if (creatingVoice) return;
   creatingVoice = true;
@@ -449,7 +516,9 @@ export function initUserProfile(slotEl, { onChange, showToast } = {}) {
   rootEl = document.createElement('div');
   rootEl.className = 'user-profile';
   rootEl.innerHTML = `
-    <button type="button" class="user-profile-trigger" id="user-profile-trigger" aria-haspopup="true" aria-expanded="false">?</button>
+    <button type="button" class="user-profile-trigger" id="user-profile-trigger" data-visual="setup" aria-haspopup="true" aria-expanded="false">
+      ${USER_PROFILE_TRIGGER_ICON}
+    </button>
     <div class="user-profile-panel" id="user-profile-panel" hidden></div>
   `;
   slotEl.appendChild(rootEl);

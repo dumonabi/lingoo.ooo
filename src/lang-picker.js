@@ -1,6 +1,16 @@
+import { createTypingCaret, measureCharCell, positionBlockCaret } from './caret-style.js';
+
 const MIN_QUERY_LENGTH = 2;
 
-export function createLangPicker(container, { languages, value, onChange, placeholder = 'Language' }) {
+const langPickerRegistry = [];
+
+export function hideAllLangPickerCarets() {
+  for (const entry of langPickerRegistry) {
+    entry.hideCaret();
+  }
+}
+
+export function createLangPicker(container, { languages, value, onChange, placeholder = '', onFocusEdit } = {}) {
   let selectedCode = value || '';
 
   const root = document.createElement('div');
@@ -8,6 +18,18 @@ export function createLangPicker(container, { languages, value, onChange, placeh
 
   const inputWrap = document.createElement('div');
   inputWrap.className = 'lang-picker-input-wrap';
+
+  const field = document.createElement('div');
+  field.className = 'lang-picker-field';
+
+  const mirror = document.createElement('div');
+  mirror.className = 'compose-caret-mirror lang-picker-caret-mirror';
+  mirror.setAttribute('aria-hidden', 'true');
+
+  const caret = document.createElement('span');
+  caret.className = 'compose-caret lang-picker-caret';
+  caret.setAttribute('aria-hidden', 'true');
+  caret.hidden = true;
 
   const input = document.createElement('input');
   input.type = 'text';
@@ -20,9 +42,23 @@ export function createLangPicker(container, { languages, value, onChange, placeh
   list.className = 'lang-picker-list';
   list.hidden = true;
 
-  inputWrap.append(input);
+  field.append(mirror, caret, input);
+  inputWrap.append(field);
   root.append(inputWrap, list);
   container.appendChild(root);
+
+  const entry = {
+    hideCaret() {
+      caret.hidden = true;
+      inputWrap.classList.remove('is-editing');
+    },
+  };
+  langPickerRegistry.push(entry);
+  const typingCaret = createTypingCaret(caret);
+
+  function pulseTypingCaret() {
+    typingCaret.pulse();
+  }
 
   function findLang(code) {
     return languages.find((l) => l.code === code);
@@ -47,11 +83,74 @@ export function createLangPicker(container, { languages, value, onChange, placeh
     list.hidden = items.length === 0;
   }
 
+  function syncCaret() {
+    const focused = document.activeElement === input;
+    inputWrap.classList.toggle('is-editing', focused);
+    inputWrap.classList.toggle('is-empty', !input.value);
+
+    if (!focused) {
+      caret.hidden = true;
+      typingCaret.reset();
+      return;
+    }
+
+    caret.hidden = false;
+
+    const style = getComputedStyle(input);
+    mirror.style.width = `${input.clientWidth}px`;
+    mirror.style.font = style.font;
+    mirror.style.fontSize = style.fontSize;
+    mirror.style.fontFamily = style.fontFamily;
+    mirror.style.fontWeight = style.fontWeight;
+    mirror.style.lineHeight = style.lineHeight;
+    mirror.style.letterSpacing = style.letterSpacing;
+    mirror.style.textAlign = style.textAlign;
+    mirror.style.padding = '0';
+    mirror.style.border = 'none';
+    mirror.style.boxSizing = style.boxSizing;
+
+    const caretPos = input.selectionStart ?? input.value.length;
+    const textBefore = input.value.slice(0, caretPos);
+    const textAfter = input.value.slice(caretPos);
+
+    mirror.replaceChildren();
+    mirror.append(document.createTextNode(textBefore));
+    const marker = document.createElement('span');
+    marker.textContent = '\u200b';
+    mirror.append(marker);
+    if (textAfter) mirror.append(document.createTextNode(textAfter));
+
+    const markerRect = marker.getBoundingClientRect();
+    const fieldRect = field.getBoundingClientRect();
+    const { charWidth, lineHeight } = measureCharCell(mirror, style);
+
+    positionBlockCaret(caret, {
+      left: markerRect.left - fieldRect.left,
+      top: markerRect.top - fieldRect.top,
+      charWidth,
+      lineHeight,
+    });
+  }
+
   function showSelectedDisplay() {
     const lang = findLang(selectedCode);
     input.value = lang ? lang.name : '';
     input.placeholder = lang ? '' : placeholder;
+    inputWrap.classList.remove('is-editing');
     list.hidden = true;
+    syncCaret();
+  }
+
+  function beginEditing() {
+    hideAllLangPickerCarets();
+    onFocusEdit?.();
+    input.value = '';
+    input.placeholder = '';
+    list.hidden = true;
+    requestAnimationFrame(() => {
+      input.setSelectionRange(0, 0);
+      syncCaret();
+    });
   }
 
   function select(code) {
@@ -65,18 +164,17 @@ export function createLangPicker(container, { languages, value, onChange, placeh
   }
 
   input.addEventListener('focus', () => {
-    const lang = findLang(selectedCode);
-    if (lang && input.value === lang.name) {
-      input.select();
-    }
-    renderList();
+    beginEditing();
   });
 
   input.addEventListener('input', () => {
     renderList();
+    pulseTypingCaret();
+    syncCaret();
   });
 
   input.addEventListener('keydown', (e) => {
+    pulseTypingCaret();
     const options = [...list.querySelectorAll('.lang-picker-option')];
     if (e.key === 'Escape') {
       showSelectedDisplay();
@@ -89,6 +187,16 @@ export function createLangPicker(container, { languages, value, onChange, placeh
       options[0].focus();
     }
   });
+
+  input.addEventListener('keyup', () => {
+    pulseTypingCaret();
+    syncCaret();
+  });
+  input.addEventListener('click', () => {
+    pulseTypingCaret();
+    syncCaret();
+  });
+  input.addEventListener('select', syncCaret);
 
   input.addEventListener('blur', () => {
     window.setTimeout(() => {
