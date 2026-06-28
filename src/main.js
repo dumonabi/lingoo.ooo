@@ -52,11 +52,6 @@ let activeConverseController = null;
 let draftTranslationPrefetch = null;
 let draftPrefetchSeq = 0;
 let pendingSourceRecording = null;
-let dubbingLanguages = new Set([
-  'ar', 'cs', 'da', 'de', 'el', 'en', 'es', 'fi', 'fr', 'hi', 'hu', 'id', 'it',
-  'ja', 'ko', 'ms', 'nl', 'no', 'pl', 'pt', 'ro', 'ru', 'sv', 'tr', 'uk', 'vi',
-  'zh', 'tl', 'ta',
-]);
 let cloneVoiceLanguages = new Set([
   'ar', 'bg', 'cs', 'da', 'de', 'el', 'en', 'es', 'fi', 'fr', 'hi', 'hr', 'id',
   'it', 'ja', 'ko', 'ms', 'nl', 'pl', 'pt', 'ro', 'ru', 'sk', 'sv', 'ta', 'tl',
@@ -207,18 +202,6 @@ function invalidateMessageAudio(msg) {
   msg._audioPromise = null;
 }
 
-function resolveDubbingLanguage(code) {
-  const normalized = String(code || '').toLowerCase().trim();
-  if (!normalized) return null;
-  const mapped = normalized === 'nn' ? 'no' : normalized;
-  if (!dubbingLanguages.has(mapped)) return null;
-  return mapped;
-}
-
-function dubbingLanguageName(code) {
-  return state.languages.find((lang) => lang.code === code)?.name || code;
-}
-
 function inferMessageTargetLanguage(msg) {
   if (msg.targetLanguage) return msg.targetLanguage;
   const { lang1, lang2 } = getLanguagePair();
@@ -226,27 +209,6 @@ function inferMessageTargetLanguage(msg) {
   if (detected === lang1) return lang2;
   if (detected === lang2) return lang1;
   return null;
-}
-
-function isNaturalDeliveryAvailable(msg) {
-  const target = inferMessageTargetLanguage(msg);
-  if (!target) return false;
-  return resolveDubbingLanguage(target) != null;
-}
-
-function dubbingBusyError(message) {
-  if (!message?.includes('Too many concurrent requests')) return null;
-  return 'Natural delivery is busy — wait a minute for other jobs to finish, then try again';
-}
-
-function dubbingLanguageError(code) {
-  const name = dubbingLanguageName(code);
-  return `Natural delivery to ${name} isn't available yet. ElevenLabs dubbing doesn't support this language — try translating into English, Spanish, Chinese, Japanese, or Vietnamese instead.`;
-}
-
-function estimateDubSeconds(recordingMs) {
-  const audioSec = Math.max(2, (Number(recordingMs) || 0) / 1000);
-  return Math.round(Math.min(90, Math.max(28, audioSec * 2.5 + 22)));
 }
 
 function invalidateMessageDub(msg) {
@@ -265,24 +227,12 @@ function stopDubCountdown(msg) {
 
 function dubStatusText(msg) {
   if (msg.dubStatus !== 'loading') return '';
-  const elapsed = Math.floor((Date.now() - (msg.dubStartedAt || Date.now())) / 1000);
-  const remaining = Math.max(0, (msg.dubEstimateSec || 30) - elapsed);
-  if (remaining > 0) {
-    return `Creating natural delivery… about ${remaining}s remaining`;
-  }
-  return 'Still working — almost there…';
+  return 'Creating audio with your voice… a few seconds';
 }
 
 function startDubCountdown(msg) {
   stopDubCountdown(msg);
-  msg._dubTickTimer = window.setInterval(() => {
-    if (msg.dubStatus !== 'loading' || msg.id !== state.latestMessageId) {
-      stopDubCountdown(msg);
-      return;
-    }
-    const el = getMessageCardEl(msg)?.querySelector('.message-dub-status');
-    if (el) el.textContent = dubStatusText(msg);
-  }, 1000);
+  msg._dubTickTimer = null;
 }
 
 function cancelMessageDub(msg) {
@@ -1098,9 +1048,6 @@ async function checkHealth() {
     const res = await fetch('/api/health');
     const data = await res.json();
     authRequired = Boolean(data.authRequired);
-    if (Array.isArray(data.dubbingLanguages) && data.dubbingLanguages.length) {
-      dubbingLanguages = new Set(data.dubbingLanguages);
-    }
     if (Array.isArray(data.cloneVoiceLanguages) && data.cloneVoiceLanguages.length) {
       cloneVoiceLanguages = new Set(data.cloneVoiceLanguages);
     }
@@ -2831,7 +2778,7 @@ function renderDubPanel(msg) {
   if (msg.dubStatus === 'loading') {
     return `
       <div class="message-dub-panel is-loading" aria-busy="true" aria-live="polite">
-        <p class="message-dub-label">Natural delivery</p>
+        <p class="message-dub-label">Your voice</p>
         <p class="message-dub-status">${escapeHtml(dubStatusText(msg))}</p>
       </div>
     `;
@@ -2840,12 +2787,12 @@ function renderDubPanel(msg) {
   if (msg.dubStatus === 'ready' && msg.dubAudioUrl) {
     return `
       <div class="message-dub-panel is-ready">
-        <p class="message-dub-label">Natural delivery</p>
+        <p class="message-dub-label">Your voice</p>
         <div class="message-dub-actions">
-          <button type="button" class="icon-btn dub-listen-btn" title="Listen" aria-label="Listen to natural delivery">
+          <button type="button" class="icon-btn dub-listen-btn" title="Listen" aria-label="Listen to your voice">
             ${LISTEN_BTN_SVG}
           </button>
-          <button type="button" class="icon-btn dub-share-btn" title="Share audio" aria-label="Share natural delivery">
+          <button type="button" class="icon-btn dub-share-btn" title="Share audio" aria-label="Share your voice audio">
             ${SHARE_AUDIO_BTN_SVG}
           </button>
         </div>
@@ -2856,8 +2803,8 @@ function renderDubPanel(msg) {
   if (msg.dubStatus === 'error') {
     return `
       <div class="message-dub-panel is-error" role="alert">
-        <p class="message-dub-label">Natural delivery</p>
-        <p class="message-dub-error">${escapeHtml(msg.dubError || 'Dubbing failed — try again')}</p>
+        <p class="message-dub-label">Your voice</p>
+        <p class="message-dub-error">${escapeHtml(msg.dubError || 'Could not create audio — try again')}</p>
       </div>
     `;
   }
@@ -2868,7 +2815,8 @@ function renderDubPanel(msg) {
 function showDubWand(msg) {
   if (msg._loading || msg._streaming) return false;
   if (msg.dubStatus === 'ready') return false;
-  return isNaturalDeliveryAvailable(msg);
+  if (!msg.translated?.trim()) return false;
+  return Boolean(resolveSourceRecording(msg)?.blob);
 }
 
 function resolveSourceRecording(msg) {
@@ -2883,69 +2831,19 @@ function resolveSourceRecording(msg) {
   return msg.sourceRecording;
 }
 
-async function pollDubbingJob(msg, signal) {
-  const deadline = Date.now() + 6 * 60 * 1000;
-  while (Date.now() < deadline) {
-    if (signal.aborted || msg.id !== state.latestMessageId) {
-      throw new DOMException('Aborted', 'AbortError');
-    }
-
-    const res = await apiFetch(`/api/dub/${encodeURIComponent(msg.dubId)}/status`, { signal });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data.error || 'Could not check dubbing status');
-    }
-
-    const status = String(data.status || '').toLowerCase();
-    if (status === 'dubbed') return;
-    if (status === 'failed') {
-      throw new Error(data.error || 'Dubbing failed');
-    }
-
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(resolve, 4000);
-      signal.addEventListener('abort', () => {
-        clearTimeout(timer);
-        reject(new DOMException('Aborted', 'AbortError'));
-      }, { once: true });
-    });
-  }
-
-  throw new Error('Dubbing timed out — try again');
-}
-
 async function startOptionalDubbing(msg, wandBtn) {
   if (msg.dubStatus === 'loading') return;
   if (wandBtn?.dataset.busy === '1') return;
 
-  const recording = resolveSourceRecording(msg);
-  if (!recording?.blob) {
-    showToast('Natural delivery needs your voice recording — record a message first');
-    return;
-  }
-
-  const targetLang = inferMessageTargetLanguage(msg);
-  if (!targetLang) {
+  if (!msg.translated?.trim()) {
     showToast('Translation still loading — try again in a moment');
-    return;
-  }
-
-  const dubTargetLang = resolveDubbingLanguage(targetLang);
-  if (!dubTargetLang) {
-    msg.dubStatus = 'error';
-    msg.dubError = dubbingLanguageError(targetLang);
-    renderConversation();
-    showToast(msg.dubError);
     return;
   }
 
   cancelMessageDub(msg);
   msg.dubStatus = 'loading';
-  msg.dubEstimateSec = estimateDubSeconds(recording.recordingMs);
-  msg.dubStartedAt = Date.now();
   msg.dubError = null;
-  msg.dubId = null;
-  msg.dubTargetLang = dubTargetLang;
+  msg.dubAudioUrl = null;
 
   if (wandBtn) {
     wandBtn.dataset.busy = '1';
@@ -2959,53 +2857,37 @@ async function startOptionalDubbing(msg, wandBtn) {
   msg._dubPollAbort = controller;
 
   try {
-    const { lang1, lang2 } = getLanguagePair();
-    const sourceLang = msg.detectedLanguage || lang1;
-    const mimeType = recording.mimeType || 'audio/webm';
-    const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
-
-    const form = new FormData();
-    form.append('audio', recording.blob, `audio.${ext}`);
-    form.append('sourceLang', sourceLang);
-    form.append('targetLang', targetLang);
-    form.append('recordingMs', String(recording.recordingMs || 0));
-
-    const startRes = await apiFetch('/api/dub/start', {
+    const targetLang = inferMessageTargetLanguage(msg);
+    const res = await apiFetch('/api/dub/render', {
       method: 'POST',
-      body: form,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: msg.translated,
+        lang: targetLang,
+        voiceMode: speakModeForMessage(msg),
+      }),
       signal: controller.signal,
     });
-    const startData = await startRes.json().catch(() => ({}));
-    if (!startRes.ok) {
-      const errMsg = startData.error || dubbingBusyError(startData.error) || 'Could not start dubbing';
-      throw new Error(errMsg);
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'Could not create audio');
     }
 
-    msg.dubId = startData.dubbingId;
-    msg.dubTargetLang = startData.targetLang || dubTargetLang;
-    if (startData.estimatedSeconds) msg.dubEstimateSec = startData.estimatedSeconds;
-
-    startDubCountdown(msg);
-    await pollDubbingJob(msg, controller.signal);
-
-    const audioRes = await apiFetch(
-      `/api/dub/${encodeURIComponent(msg.dubId)}/audio?lang=${encodeURIComponent(msg.dubTargetLang)}`,
-      { signal: controller.signal },
-    );
-    if (!audioRes.ok) {
-      const errData = await audioRes.json().catch(() => ({}));
-      throw new Error(errData.error || 'Could not fetch dubbed audio');
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('audio')) {
+      throw new Error('Could not create audio');
     }
 
-    const blob = await audioRes.blob();
-    if (!blob.size) throw new Error('Dubbed audio was empty');
+    const blob = await res.blob();
+    if (!blob.size) throw new Error('Audio was empty');
 
     msg.dubAudioUrl = URL.createObjectURL(blob);
     msg.dubStatus = 'ready';
   } catch (err) {
     if (err?.name === 'AbortError') return;
     msg.dubStatus = 'error';
-    msg.dubError = dubbingBusyError(err.message) || err.message || 'Dubbing failed';
+    msg.dubError = err.message || 'Could not create audio';
     showToast(msg.dubError);
   } finally {
     stopDubCountdown(msg);
@@ -3112,7 +2994,7 @@ function createMessageCard(msg) {
     </div>
     ${dubPanelHtml}
     <div class="message-voice-tools"${wandVisible ? '' : ' hidden'}>
-      <button type="button" class="message-voice-wand${msg.dubStatus === 'loading' ? ' is-loading' : ''}" title="Try natural delivery dubbing" aria-label="Try natural delivery dubbing"${msg.dubStatus === 'loading' ? ' disabled aria-busy="true"' : ''}>
+      <button type="button" class="message-voice-wand${msg.dubStatus === 'loading' ? ' is-loading' : ''}" title="Generate audio with your voice profile" aria-label="Generate audio with your voice profile"${msg.dubStatus === 'loading' ? ' disabled aria-busy="true"' : ''}>
         ${WAND_BTN_SVG}
       </button>
     </div>

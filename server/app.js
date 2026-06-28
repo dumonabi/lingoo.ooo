@@ -34,16 +34,7 @@ import {
   createVoiceClone,
   generateClonedSpeech,
   isElevenLabsConfigured,
-  startDubbingJob,
-  getDubbingStatus,
-  fetchDubbingAudio,
 } from './elevenlabs.js';
-import {
-  dubbingLanguageError,
-  isDubbingLanguageSupported,
-  listDubbingLanguageCodes,
-  resolveDubbingLanguage,
-} from './dubbing-languages.js';
 import {
   listCloneVoiceLanguageCodes,
   supportsClonedVoice,
@@ -219,7 +210,12 @@ function scoreLatinLanguage(text, code) {
 }
 
 function likelyLatinLanguage(text, lang1, lang2) {
-  if (!LATIN_LANGS.has(lang1) || !LATIN_LANGS.has(lang2)) return null;
+  const l1Latin = LATIN_LANGS.has(lang1);
+  const l2Latin = LATIN_LANGS.has(lang2);
+  if (!l1Latin && !l2Latin) return null;
+  if (l1Latin && !l2Latin) return lang1;
+  if (l2Latin && !l1Latin) return lang2;
+
   const s1 = scoreLatinLanguage(text, lang1);
   const s2 = scoreLatinLanguage(text, lang2);
   if (s1 === s2) return null;
@@ -278,6 +274,14 @@ function inferDetectedFromText(text, lang1, lang2) {
   const hint = textScriptHint(text);
   if (hintMatchesLang(hint, lang1) === true) return lang1;
   if (hintMatchesLang(hint, lang2) === true) return lang2;
+
+  if (hint === 'latin') {
+    const l1Latin = LATIN_LANGS.has(lang1);
+    const l2Latin = LATIN_LANGS.has(lang2);
+    if (l1Latin && !l2Latin) return lang1;
+    if (l2Latin && !l1Latin) return lang2;
+  }
+
   const likely = likelyLatinLanguage(text, lang1, lang2);
   if (likely) return likely;
   return null;
@@ -459,11 +463,6 @@ function prepareTextForSpeech(text, lang) {
     .replace(/\s+/g, ' ');
 }
 
-function estimateDubSeconds(recordingMs) {
-  const audioSec = Math.max(2, (Number(recordingMs) || 0) / 1000);
-  return Math.round(Math.min(90, Math.max(28, audioSec * 2.5 + 22)));
-}
-
 export function createApp() {
   const app = express();
 
@@ -477,7 +476,6 @@ export function createApp() {
       ok: true,
       authRequired: isAuthRequired(),
       dubbingConfigured: isElevenLabsConfigured(),
-      dubbingLanguages: listDubbingLanguageCodes(),
       cloneVoiceLanguages: listCloneVoiceLanguageCodes(),
     });
   });
@@ -698,92 +696,34 @@ export function createApp() {
     }
   });
 
-  app.post('/api/dub/start', requireAppAuth, dubRateLimit, upload.single('audio'), async (req, res) => {
-    if (!isElevenLabsConfigured()) {
-      return res.status(503).json({ error: 'Dubbing is not configured on this server' });
-    }
+  app.post('/api/dub/render', requireAppAuth, dubRateLimit, async (req, res) => {
+    const openai = requireOpenAI(res);
+    if (!openai) return;
 
-    const targetLang = String(req.body.targetLang || '').toLowerCase().trim();
-    const sourceLang = String(req.body.sourceLang || 'auto').toLowerCase().trim();
-    const recordingMs = Number(req.body.recordingMs || 0);
+    const text = String(req.body.text || '').trim();
+    const langCode = String(req.body.lang || req.body.targetLang || '').toLowerCase().trim();
+    const wantsClone = req.body.voiceMode !== 'default';
 
-    if (!targetLang) {
-      return res.status(400).json({ error: 'Target language is required' });
-    }
-    if (!isDubbingLanguageSupported(targetLang)) {
-      return res.status(400).json({ error: dubbingLanguageError(targetLang) });
-    }
-    const dubTargetLang = resolveDubbingLanguage(targetLang);
-    const dubSourceLang = sourceLang === 'auto' ? 'auto' : (resolveDubbingLanguage(sourceLang) || sourceLang);
-    if (!req.file?.buffer?.length) {
-      return res.status(400).json({ error: 'No audio received' });
+    if (!text) {
+      return res.status(400).json({ error: 'Text is required' });
     }
 
     try {
-      const dubbingId = await startDubbingJob({
-        buffer: req.file.buffer,
-        mimeType: req.file.mimetype || 'audio/webm',
-        sourceLang: dubSourceLang,
-        targetLang: dubTargetLang,
-      });
+      const voiceProfile = await getVoiceProfile(req.user.id);
+      const voiceId = resolveVoiceId(req.user, voiceProfile);
+      const useClone = wantsClone && voiceId && supportsClonedVoice(langCode);
 
-      res.json({
-        dubbingId,
-        targetLang: dubTargetLang,
-        estimatedSeconds: estimateDubSeconds(recordingMs),
-      });
-    } catch (err) {
-      console.error('Dub start error:', err);
-      const message = formatApiError(err);
-      const status = message.includes('Natural delivery is busy') ? 429 : 500;
-      res.status(status).json({ error: message });
-    }
-  });
+      if (wantsClone && supportsClonedVoice(langCode) && !voiceId) {
+        return res.status(400).json({ error: 'Personal voice not ready — set up your voice profile first' });
+      }
 
-  app.get('/api/dub/:id/status', requireAppAuth, dubRateLimit, async (req, res) => {
-    if (!isElevenLabsConfigured()) {
-      return res.status(503).json({ error: 'Dubbing is not configured on this server' });
-    }
-
-    const dubbingId = String(req.params.id || '').trim();
-    if (!dubbingId) {
-      return res.status(400).json({ error: 'Dubbing id is required' });
-    }
-
-    try {
-      const data = await getDubbingStatus(dubbingId);
-      res.json({
-        status: data?.status || 'unknown',
-        error: data?.error || null,
-      });
-    } catch (err) {
-      console.error('Dub status error:', err);
-      res.status(500).json({ error: formatApiError(err) });
-    }
-  });
-
-  app.get('/api/dub/:id/audio', requireAppAuth, dubRateLimit, async (req, res) => {
-    if (!isElevenLabsConfigured()) {
-      return res.status(503).json({ error: 'Dubbing is not configured on this server' });
-    }
-
-    const dubbingId = String(req.params.id || '').trim();
-    const targetLang = String(req.query.lang || '').toLowerCase().trim();
-
-    if (!dubbingId || !targetLang) {
-      return res.status(400).json({ error: 'Dubbing id and target language are required' });
-    }
-    if (!isDubbingLanguageSupported(targetLang)) {
-      return res.status(400).json({ error: dubbingLanguageError(targetLang) });
-    }
-
-    try {
-      const buffer = await fetchDubbingAudio(dubbingId, resolveDubbingLanguage(targetLang));
+      const buffer = await generateSpeech(openai, text, langCode, useClone ? voiceId : null);
       res.set('Content-Type', 'audio/mpeg');
       res.set('Cache-Control', 'private, max-age=3600');
+      res.set('X-Voice-Mode', useClone ? 'clone' : 'default');
       res.send(buffer);
     } catch (err) {
-      console.error('Dub audio error:', err);
+      console.error('Voice render error:', err);
       res.status(500).json({ error: formatApiError(err) });
     }
   });
