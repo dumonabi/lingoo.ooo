@@ -145,7 +145,7 @@ test.describe('Lingu.ooo', () => {
   test('shows the voice button after translation', async ({ page }) => {
     await prepareApp(page);
     await recordOnce(page);
-    const voiceBtn = page.getByRole('button', { name: 'Listen' });
+    const voiceBtn = page.getByRole('button', { name: 'Play' });
     await expect(voiceBtn).toBeVisible({ timeout: 8000 });
   });
 

@@ -1,6 +1,6 @@
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import {
-  findUserByPassword,
+  findUserByPassphraseSync,
   getGuestUser,
   isAuthRequired,
 } from './users.js';
@@ -41,6 +41,12 @@ export const speakRateLimit = createLimiter({
   message: 'Too many audio requests this hour — try again later',
 });
 
+export const authRegisterRateLimit = createLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  message: 'Too many account creations — try again later',
+});
+
 export const authVerifyRateLimit = createLimiter({
   windowMs: 60 * 60 * 1000,
   max: 30,
@@ -66,7 +72,7 @@ export function resolveRequestUser(req) {
   const token = header?.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return null;
 
-  return findUserByPassword(token);
+  return findUserByPassphraseSync(token);
 }
 
 export function requireAppAuth(req, res, next) {

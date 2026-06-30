@@ -7,19 +7,24 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { LANGUAGE_NAMES, getLanguagesList } from './languages.js';
 import {
+  authRegisterRateLimit,
   authVerifyRateLimit,
   converseRateLimit,
   getCorsOptions,
   isAuthRequired,
   requireAppAuth,
+  resolveRequestUser,
   speakRateLimit,
   voiceSampleRateLimit,
 } from './security.js';
+import { isSuperUser, verifySuperUserPassword } from './bootstrap-user.js';
 import {
-  findUserByPassword,
+  createUser,
+  findUserByPassphrase,
   getGuestUser,
   publicUserProfile,
 } from './users.js';
+import { ensureUserRegistryLoaded } from './user-store.js';
 import {
   addVoiceSample,
   clearAllVoiceSamples,
@@ -69,11 +74,19 @@ function buildStreamingSystemPrompt(lang1, lang2) {
 
 function buildTranslationUserMessage(text, lang1, lang2, context, detected) {
   const trimmed = text.trim();
-  const source = detected || inferDetectedFromText(trimmed, lang1, lang2) || lang1;
-  const target = source === lang1 ? lang2 : lang1;
-  const fromName = LANGUAGE_NAMES[source] || source;
-  const toName = LANGUAGE_NAMES[target] || target;
-  const directive = `Translate from ${fromName} to ${toName}:\n${trimmed}`;
+  const inferred = detected ?? inferDetectedFromText(trimmed, lang1, lang2);
+  const name1 = LANGUAGE_NAMES[lang1] || lang1;
+  const name2 = LANGUAGE_NAMES[lang2] || lang2;
+
+  let directive;
+  if (inferred) {
+    const target = inferred === lang1 ? lang2 : lang1;
+    const fromName = LANGUAGE_NAMES[inferred] || inferred;
+    const toName = LANGUAGE_NAMES[target] || target;
+    directive = `Translate from ${fromName} to ${toName}:\n${trimmed}`;
+  } else {
+    directive = `The message is in ${name1} or ${name2}. Detect its language and translate into the other only. Output only the translation:\n${trimmed}`;
+  }
 
   const recentContext = context
     .filter((m) => [lang1, lang2].includes(m.detectedLanguage))
@@ -86,22 +99,35 @@ function buildTranslationUserMessage(text, lang1, lang2, context, detected) {
 
 function finalizeTranslation(rawText, translatedText, lang1, lang2, gptDetected = null, gptTarget = null) {
   let detected = normalizeLangCode(gptDetected, lang1, lang2)
-    || inferDetectedFromText(rawText, lang1, lang2)
-    || normalizeLangCode(gptTarget, lang1, lang2)
-    || lang1;
-  const target = detected === lang1 ? lang2 : lang1;
+    || inferDetectedFromText(rawText, lang1, lang2);
 
   const sourceText = stripTrailingPeriod(rawText.trim());
   let translated = stripTrailingPeriod(translatedText || '');
 
-  const aligned = alignTranslationFields(sourceText, translated, detected, target);
+  const provisionalTarget = detected
+    ? (detected === lang1 ? lang2 : lang1)
+    : lang2;
+  const aligned = alignTranslationFields(
+    sourceText,
+    translated,
+    detected || lang1,
+    provisionalTarget,
+  );
   translated = aligned.translatedText === sourceText && aligned.sourceText !== sourceText
     ? aligned.sourceText
     : aligned.translatedText;
 
+  if (!detected) {
+    detected = inferDetectedFromTranslation(aligned.sourceText, translated, lang1, lang2);
+  }
+  if (!detected) {
+    detected = normalizeLangCode(gptTarget, lang1, lang2) || lang1;
+  }
+  const target = detected === lang1 ? lang2 : lang1;
+
   return {
     detectedLanguage: detected,
-    sourceText,
+    sourceText: aligned.sourceText,
     translatedText: translated,
     targetLanguage: target,
   };
@@ -203,7 +229,10 @@ function scoreLatinLanguage(text, code) {
   if (!text || !LATIN_MARKER_PATTERNS[code]) return 0;
   const lower = text.toLowerCase();
   let score = (lower.match(LATIN_MARKER_PATTERNS[code]) || []).length;
-  if (code === 'es') score += (lower.match(/[ñáéíóúü¿¡]/g) || []).length * 2;
+  if (code === 'es') {
+    score += (lower.match(/[ñáéíóúü¿¡]/g) || []).length * 2;
+    if (/\w+(ción|sión|miento|dad|tad|mente|illo|illa|ando|iendo|ado|ada)\b/i.test(lower)) score += 1.5;
+  }
   if (code === 'pt') score += (lower.match(/[ãõçáéíóú]/g) || []).length * 1.5;
   if (code === 'fr') score += (lower.match(/[àâçéèêëîïôùûü]/g) || []).length * 1.5;
   return score;
@@ -284,6 +313,25 @@ function inferDetectedFromText(text, lang1, lang2) {
 
   const likely = likelyLatinLanguage(text, lang1, lang2);
   if (likely) return likely;
+  return null;
+}
+
+function inferDetectedFromTranslation(sourceText, translatedText, lang1, lang2) {
+  const source = sourceText?.trim();
+  const translated = translatedText?.trim();
+  if (!source || !translated) return null;
+  if (source.toLowerCase() === translated.toLowerCase()) return null;
+
+  const sourceLikely = likelyLatinLanguage(source, lang1, lang2);
+  const translatedLikely = likelyLatinLanguage(translated, lang1, lang2);
+
+  if (sourceLikely && translatedLikely && sourceLikely !== translatedLikely) {
+    return sourceLikely;
+  }
+  if (sourceLikely && !translatedLikely) return sourceLikely;
+  if (!sourceLikely && translatedLikely) {
+    return translatedLikely === lang1 ? lang2 : lang1;
+  }
   return null;
 }
 
@@ -470,6 +518,15 @@ export function createApp() {
   app.use(cors(getCorsOptions()));
   app.use(express.json({ limit: '1mb' }));
 
+  app.use('/api', async (req, res, next) => {
+    try {
+      await ensureUserRegistryLoaded();
+      next();
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.get('/api/health', (_req, res) => {
     res.set('Cache-Control', 'no-store');
     res.json({
@@ -479,6 +536,38 @@ export function createApp() {
     });
   });
 
+  app.post('/api/auth/register', authRegisterRateLimit, async (req, res) => {
+    if (!isAuthRequired()) {
+      return res.status(400).json({ error: 'Registration is disabled' });
+    }
+
+    const requestUser = resolveRequestUser(req);
+    const authorized = (requestUser && isSuperUser(requestUser))
+      || verifySuperUserPassword(req.body?.superPassword);
+
+    if (!authorized) {
+      return res.status(403).json({ error: 'Admin password required' });
+    }
+
+    const name = String(req.body?.name || '').trim();
+    if (name.length > 48) {
+      return res.status(400).json({ error: 'Name is too long' });
+    }
+
+    try {
+      const { user, recoveryPhrase } = await createUser({ name });
+      const voiceProfile = await getVoiceProfile(user.id);
+      return res.json({
+        ok: true,
+        user: publicUserProfile(user, voiceProfile),
+        recoveryPhrase,
+      });
+    } catch (err) {
+      console.error('Register error:', err);
+      return res.status(500).json({ error: 'Could not create account' });
+    }
+  });
+
   app.post('/api/auth/verify', authVerifyRateLimit, async (req, res) => {
     if (!isAuthRequired()) {
       const guest = getGuestUser();
@@ -486,14 +575,14 @@ export function createApp() {
       return res.json({ ok: true, user: publicUserProfile(guest, voiceProfile) });
     }
 
-    const { password } = req.body || {};
-    const user = findUserByPassword(password);
+    const attempt = req.body?.passphrase || req.body?.password;
+    const user = await findUserByPassphrase(attempt);
     if (user) {
       const voiceProfile = await getVoiceProfile(user.id);
       return res.json({ ok: true, user: publicUserProfile(user, voiceProfile) });
     }
 
-    res.status(401).json({ error: 'Wrong access code' });
+    res.status(401).json({ error: 'Wrong recovery phrase or password' });
   });
 
   app.get('/api/me', requireAppAuth, async (req, res) => {

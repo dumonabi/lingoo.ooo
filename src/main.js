@@ -1,7 +1,12 @@
 import { createLangPicker, hideAllLangPickerCarets } from './lang-picker.js';
+import { listCloneVoiceLanguageCodes, supportsClonedVoice } from './elevenlabs-languages.js';
 import { createTypingCaret, measureCharCell, positionBlockCaret } from './caret-style.js';
 import { CHAMELEON_LOGO_SVG } from './chameleon-logo.js';
-import { apiFetch, clearAuthToken, fetchCurrentUser, getAuthToken, setAuthToken, setStoredUser } from './auth.js';
+import { $, escapeHtml } from './dom-utils.js';
+import { createMicWave } from './mic-wave.js';
+import { getRecordingMimeType } from './media-utils.js';
+import { apiFetch, clearAuthToken, fetchCurrentUser, getAuthToken, setStoredUser } from './auth.js';
+import { mountAuthGate, openAuthGate, resetAuthGate } from './auth-gate.js';
 import { initUserProfile, refreshUserSession } from './user-profile.js';
 import {
   clearAllPendingRecordings,
@@ -14,10 +19,16 @@ import {
   updatePendingRecording,
 } from './pending-audio.js';
 import { bindKeepWarm } from './keep-warm.js';
+import { registerPwa } from './pwa.js';
 
 const STORAGE_KEY = 'lingo-languages';
 const DEFAULT_LANG1 = 'en';
 const DEFAULT_LANG2 = 'es';
+
+const OFFLINE_LANGUAGES = [
+  { code: 'en', name: 'English' },
+  { code: 'es', name: 'Spanish' },
+];
 const MAX_RECORDING_MS = 90_000;
 const RECORDING_TAIL_MS = 150;
 const RECORDER_STOP_FLUSH_MS = 150;
@@ -45,6 +56,7 @@ const state = {
 };
 
 let playbackEpoch = 0;
+let activePlayback = null;
 let speakChain = Promise.resolve();
 let latestTranslationRequest = 0;
 let lastTranslationAppliedAt = 0;
@@ -53,16 +65,10 @@ let activeConverseController = null;
 let draftTranslationPrefetch = null;
 let draftPrefetchSeq = 0;
 let pendingSourceRecording = null;
-let cloneVoiceLanguages = new Set([
-  'ar', 'bg', 'cs', 'da', 'de', 'el', 'en', 'es', 'fi', 'fr', 'hi', 'hr', 'id',
-  'it', 'ja', 'ko', 'ms', 'nl', 'pl', 'pt', 'ro', 'ru', 'sk', 'sv', 'ta', 'tl',
-  'tr', 'uk', 'zh',
-]);
+let cloneVoiceLanguages = new Set(listCloneVoiceLanguageCodes());
 
 let picker1;
 let picker2;
-
-const $ = (sel) => document.querySelector(sel);
 
 const appEl = $('#app');
 const languageBarEl = document.querySelector('.language-bar');
@@ -70,9 +76,7 @@ const currentMessageEl = $('#current-message');
 const toastEl = $('#toast');
 const composeBoxEl = $('#compose-box');
 const composeMicBtn = $('#compose-mic');
-const composeMicProgressFill = $('#compose-mic-progress-fill');
 const composeNewBtn = $('#compose-new');
-const composeRecordingEl = $('#compose-recording');
 const composeLevelEl = $('#compose-level');
 const recordingCancelBtn = $('#recording-cancel');
 const recordingSendBtn = $('#recording-send');
@@ -80,58 +84,30 @@ const recordingSendProgressFill = $('#recording-send-progress-fill');
 const dictationInputEl = $('#dictation-input');
 const composeInputWrapEl = $('#compose-input-wrap');
 const composeCaretEl = $('#compose-caret');
+const composeLoadingDotsEl = $('#compose-loading-dots');
 const dictationTranslateBtn = $('#dictation-translate');
 
 const LOADING_DOT_MS = 500;
 const LOADING_DOT_MAX = 20;
-let loadingDotsTimer = null;
+let composeLoadingActive = false;
 
 let composeCaretMirrorEl = null;
 
-const RING_CIRCUMFERENCE = 2 * Math.PI * 54;
-const COMPOSE_MIC_RING_R = 19;
-const COMPOSE_MIC_RING_CIRCUMFERENCE = 2 * Math.PI * COMPOSE_MIC_RING_R;
-const MIC_WAVE_VISIBLE = 14;
-const MIC_WAVE_TOTAL = MIC_WAVE_VISIBLE + 1;
-const MIC_WAVE_SHIFT_MS = 46;
-const MIC_WAVE_BAR_STEP = 5;
-const MOBILE_WAVE_BARS = 3;
-const MOBILE_WAVE_UPDATE_MS = 80;
+const RECORDING_SEND_RING_R = 19;
+const RECORDING_SEND_RING_CIRCUMFERENCE = 2 * Math.PI * RECORDING_SEND_RING_R;
 
-const mobileMicWavePreferred = (() => {
-  try {
-    return window.matchMedia('(pointer: coarse), (max-width: 768px)').matches;
-  } catch {
-    return false;
-  }
-})();
-const MIC_BAR_IDLE = 0.05;
-const MIC_BAR_TRIGGER = 0.22;
-const MIC_VOICE_GATE = 0.1;
-const COMPOSE_WAVE_VISIBLE = 12;
+const composeMicWave = createMicWave();
 
-let progressRaf = null;
-let transcribeProgressRaf = null;
-let transcribeProgressStartedAt = 0;
-let transcribeProgressEstimateMs = 2500;
 let recordingProgressRaf = null;
-let progressStartedAt = 0;
-let progressEstimateMs = 4000;
 let pendingQueueBusy = false;
 let pendingRetryTimer = null;
-let streamProgressFinished = false;
-let micMeter = null;
-let micMeterCtx = null;
-let micWaveSlots = [];
-let micWaveBarEls = [];
-let micWaveScrollEl = null;
-let micWaveLastShift = 0;
-let micWaveShiftBusy = false;
 
 const COPY_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>';
-const SHARE_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z"/></svg>';
-const LISTEN_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>';
-const SHARE_AUDIO_BTN_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 10v4h2l3.5 3.5V6.5L6 10H4z" fill="currentColor" stroke="none"/><path d="M13 12h7"/><path d="M17 8l4 4-4 4"/></svg>';
+const SHARE_BTN_SVG = '<svg class="footer-share-text-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z"/></svg>';
+const PLAY_BTN_SVG = '<svg class="listen-btn-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
+const PAUSE_BTN_SVG = '<svg class="listen-btn-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
+const RESTART_PLAYBACK_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>';
+const SHARE_AUDIO_BTN_SVG = '<svg class="footer-share-audio-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M2.5 9.25v5.5h3.2l6 6V3.25L5.7 9.25H2.5z"/><path d="M13.1 11h8.7v2h-8.7v-2zm4.15-5.55 5.55 5.55-5.55 5.55V13.1h-3.7v-2.2h3.7V6.45z"/></svg>';
 
 function prefetchAudio(msg) {
   return loadMessageAudio(msg, { prefetch: true });
@@ -140,9 +116,16 @@ function prefetchAudio(msg) {
 function speakModeForMessage(msg) {
   const lang = msg.targetLanguage;
   if (!lang || !state.user?.voiceReady) return 'default';
-  const code = lang === 'nn' ? 'no' : lang;
-  if (!cloneVoiceLanguages.has(code)) return 'default';
+  if (!supportsClonedVoice(lang)) return 'default';
   return 'clone';
+}
+
+function syncListenBtnVoiceMode(msg) {
+  const btn = getListenBtn(msg);
+  if (!btn) return;
+  const usesClone = speakModeForMessage(msg) === 'clone';
+  btn.classList.toggle('uses-clone-voice', usesClone);
+  btn.classList.toggle('uses-fallback-voice', !usesClone);
 }
 
 function audioCacheKey(msg) {
@@ -155,12 +138,100 @@ function getMessageCardEl(message) {
   return document.querySelector(`.message-card[data-message-id="${message.id}"]`);
 }
 
+function getListenBtn(message) {
+  return getMessageCardEl(message)?.querySelector('.listen-btn');
+}
+
+function setListenButtonState(btn, mode) {
+  if (!btn) return;
+
+  btn.classList.remove('is-playing', 'is-paused', 'is-loading', 'playing');
+  btn.disabled = false;
+
+  if (mode === 'playing') {
+    btn.classList.add('is-playing');
+    btn.innerHTML = PAUSE_BTN_SVG;
+    btn.title = 'Pause';
+    btn.setAttribute('aria-label', 'Pause');
+    return;
+  }
+
+  if (mode === 'paused') {
+    btn.classList.add('is-paused');
+    btn.innerHTML = PLAY_BTN_SVG;
+    btn.title = 'Resume';
+    btn.setAttribute('aria-label', 'Resume');
+    return;
+  }
+
+  if (mode === 'loading') {
+    btn.classList.add('is-loading');
+    btn.innerHTML = PLAY_BTN_SVG;
+    btn.title = 'Loading audio';
+    btn.setAttribute('aria-label', 'Loading audio');
+    return;
+  }
+
+  btn.innerHTML = PLAY_BTN_SVG;
+  btn.title = 'Play';
+  btn.setAttribute('aria-label', 'Play');
+}
+
+function setPlaybackRestartVisible(message, mode) {
+  const card = getMessageCardEl(message);
+  const restartBtn = card?.querySelector('.playback-restart-btn');
+  const restartSpacer = card?.querySelector('.message-playback-side-right');
+  const footer = card?.querySelector('.message-footer-actions');
+  const audio = state.currentAudio;
+
+  const showRestart = mode === 'paused'
+    && activePlayback?.messageId === message.id
+    && audio
+    && audio.paused
+    && !audio.ended
+    && audio.currentTime > 0.25;
+
+  if (restartBtn) restartBtn.hidden = !showRestart;
+  if (restartSpacer) restartSpacer.hidden = !showRestart;
+}
+
+function syncPlaybackUi(message, mode) {
+  setListenButtonState(getListenBtn(message), mode);
+  syncListenBtnVoiceMode(message);
+  setPlaybackRestartVisible(message, mode);
+}
+
+function restartActivePlayback(msg) {
+  const audio = state.currentAudio;
+  if (!audio || activePlayback?.messageId !== msg.id) return;
+
+  audio.pause();
+  try {
+    audio.currentTime = 0;
+  } catch {
+    // ignore seek errors
+  }
+  syncPlaybackUi(msg, 'idle');
+}
+
+function resetActiveListenButton() {
+  const latest = state.messages.at(-1);
+  if (!latest) return;
+  syncPlaybackUi(latest, 'idle');
+}
+
 function revealListenButton(message) {
-  const listenWrap = getMessageCardEl(message)?.querySelector('.message-actions-listen');
-  if (!listenWrap) return;
-  listenWrap.hidden = false;
-  listenWrap.querySelector('.listen-btn')?.classList.add('is-ready');
-  listenWrap.querySelector('.share-audio-btn')?.classList.add('is-ready');
+  const card = getMessageCardEl(message);
+  const footer = card?.querySelector('.message-footer-actions');
+  const playbackSlot = card?.querySelector('.message-playback-slot');
+  const shareAudioBtn = card?.querySelector('.share-audio-btn');
+  if (!footer) return;
+
+  footer.classList.add('has-audio-actions');
+  playbackSlot?.removeAttribute('hidden');
+  shareAudioBtn?.removeAttribute('hidden');
+  card?.querySelector('.listen-btn')?.classList.add('is-ready');
+  shareAudioBtn?.classList.add('is-ready');
 }
 
 function startBackgroundAudio(message) {
@@ -173,13 +244,6 @@ function startBackgroundAudio(message) {
     if (message.id !== state.latestMessageId) return;
     revealListenButton(message);
   });
-}
-
-function resetVoiceBtn(btn) {
-  btn.classList.remove('playing', 'is-loading');
-  btn.disabled = false;
-  delete btn.dataset.busy;
-  releaseActionButtonFocus(btn);
 }
 
 function cancelMessageAudio(msg) {
@@ -214,6 +278,8 @@ function stopPlayback() {
     audio.load();
     state.currentAudio = null;
   }
+  activePlayback = null;
+  resetActiveListenButton();
 }
 
 function prepareForNewTranslation(message) {
@@ -473,59 +539,90 @@ function waitForAudioReady(audio, ms = 4000) {
   });
 }
 
-function playAudioUrl(url) {
-  const epoch = playbackEpoch;
-
-  return new Promise((resolve, reject) => {
-    const audio = new Audio();
-    audio.preload = 'auto';
-    audio.playsInline = true;
-    audio.setAttribute('playsinline', '');
-    audio.volume = 1;
-    state.currentAudio = audio;
-
-    let settled = false;
-    const finish = (fn) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      audio.onended = null;
-      audio.onerror = null;
-      if (state.currentAudio === audio) state.currentAudio = null;
-      fn();
-    };
-
-    const timer = setTimeout(() => {
-      audio.pause();
-      finish(() => reject(new Error('Playback timed out — tap again')));
-    }, 90000);
-
-    audio.onended = () => {
-      if (epoch !== playbackEpoch) {
-        finish(() => reject(new DOMException('Aborted', 'AbortError')));
-        return;
-      }
-      finish(resolve);
-    };
-    audio.onerror = () => finish(() => reject(new Error('Playback failed')));
-
-    const start = async () => {
-      try {
-        audio.src = url;
-        await waitForAudioReady(audio);
-        if (epoch !== playbackEpoch) return;
-        await audio.play();
-      } catch (err) {
-        finish(() => reject(err));
-      }
-    };
-
-    void start();
-  });
+function createPlaybackAudio(url) {
+  const audio = new Audio();
+  audio.preload = 'auto';
+  audio.playsInline = true;
+  audio.setAttribute('playsinline', '');
+  audio.volume = 1;
+  audio.src = url;
+  return audio;
 }
 
-function resetListenBtn(btn) {
-  resetVoiceBtn(btn);
+async function toggleTranslationAudio(msg, btn) {
+  acknowledgeActionButton(btn);
+  if (btn?.dataset.busy === '1') return;
+
+  const audio = state.currentAudio;
+  const sameMessage = activePlayback?.messageId === msg.id;
+
+  if (sameMessage && audio && !audio.ended) {
+    if (!audio.paused) {
+      audio.pause();
+      syncPlaybackUi(msg, 'paused');
+      return;
+    }
+
+    try {
+      syncPlaybackUi(msg, 'playing');
+      await audio.play();
+    } catch (err) {
+      showToast(err?.message || 'Playback failed');
+      syncPlaybackUi(msg, 'paused');
+    }
+    return;
+  }
+
+  await beginTranslationPlayback(msg, btn);
+}
+
+async function beginTranslationPlayback(msg, btn) {
+  if (btn) btn.dataset.busy = '1';
+  stopPlayback();
+  syncPlaybackUi(msg, 'loading');
+
+  try {
+    if (!msg.audioUrl) {
+      await loadMessageAudio(msg);
+    }
+    if (!msg.audioUrl) throw new Error('Audio not ready — tap Play again');
+
+    playbackEpoch++;
+    const epoch = playbackEpoch;
+    const audio = createPlaybackAudio(msg.audioUrl);
+    state.currentAudio = audio;
+    activePlayback = { messageId: msg.id };
+
+    audio.onended = () => {
+      if (epoch !== playbackEpoch) return;
+      state.currentAudio = null;
+      activePlayback = null;
+      syncPlaybackUi(msg, 'idle');
+    };
+    audio.onerror = () => {
+      if (epoch !== playbackEpoch) return;
+      state.currentAudio = null;
+      activePlayback = null;
+      syncPlaybackUi(msg, 'idle');
+      showToast('Playback failed');
+    };
+
+    await waitForAudioReady(audio);
+    if (epoch !== playbackEpoch) return;
+
+    syncPlaybackUi(msg, 'playing');
+    await audio.play();
+  } catch (err) {
+    if (err?.name !== 'AbortError') {
+      showToast(err?.message || 'Playback failed');
+    }
+    state.currentAudio = null;
+    activePlayback = null;
+    syncPlaybackUi(msg, 'idle');
+  } finally {
+    if (btn) delete btn.dataset.busy;
+    releaseActionButtonFocus(btn);
+  }
 }
 
 function releaseActionButtonFocus(btn) {
@@ -535,22 +632,29 @@ function releaseActionButtonFocus(btn) {
   }
 }
 
+function acknowledgeActionButton(btn) {
+  if (!btn) return;
+  btn.classList.remove('is-action-ack');
+  void btn.offsetWidth;
+  btn.classList.add('is-action-ack');
+  const done = () => {
+    btn.classList.remove('is-action-ack');
+    btn.removeEventListener('animationend', done);
+  };
+  btn.addEventListener('animationend', done);
+}
+
 async function shareTranslation(text, btn) {
+  acknowledgeActionButton(btn);
   try {
     if (typeof navigator.share === 'function') {
       await navigator.share({ text });
       return;
     }
     await navigator.clipboard.writeText(text);
-    showToast('Copied — paste to share');
   } catch (err) {
     if (err?.name === 'AbortError') return;
-    try {
-      await navigator.clipboard.writeText(text);
-      showToast('Copied — paste to share');
-    } catch {
-      showToast('Could not share');
-    }
+    showToast('Could not share');
   } finally {
     releaseActionButtonFocus(btn);
   }
@@ -574,14 +678,9 @@ async function init() {
   bindPendingQueue();
   bindDictation();
   checkMicSupport();
-  ensureComposeLevelBars();
-  if (composeMicProgressFill) {
-    composeMicProgressFill.style.strokeDasharray = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
-    composeMicProgressFill.style.strokeDashoffset = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
-  }
   if (recordingSendProgressFill) {
-    recordingSendProgressFill.style.strokeDasharray = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
-    recordingSendProgressFill.style.strokeDashoffset = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
+    recordingSendProgressFill.style.strokeDasharray = String(RECORDING_SEND_RING_CIRCUMFERENCE);
+    recordingSendProgressFill.style.strokeDashoffset = String(RECORDING_SEND_RING_CIRCUMFERENCE);
   }
   resizeDictationInput();
   updateComposeState();
@@ -590,6 +689,8 @@ async function init() {
     showToast,
     onChange: (user) => {
       state.user = user;
+      const latest = state.messages.at(-1);
+      if (latest) syncListenBtnVoiceMode(latest);
     },
   });
   void refreshUserSession();
@@ -618,63 +719,51 @@ async function ensureAuthenticated() {
   return showAuthGate();
 }
 
+let authGateMounted = false;
+
 function showAuthGate() {
   const gate = $('#auth-gate');
-  const form = $('#auth-form');
-  const input = $('#auth-input');
-  const errorEl = $('#auth-error');
-  const submitBtn = $('#auth-submit');
+  if (!gate) return Promise.resolve(false);
 
-  gate.hidden = false;
-  input.value = '';
-  errorEl.hidden = true;
+  if (!authGateMounted) {
+    mountAuthGate({
+      gate,
+      onSuccess: async (user) => {
+        if (user) state.user = user;
+        await refreshUserSession();
+      },
+      onUnauthorized: () => {
+        resetAuthGate(gate);
+        openAuthGate(gate);
+      },
+    });
+    authGateMounted = true;
+  }
+
+  resetAuthGate(gate);
+  openAuthGate(gate);
 
   return new Promise((resolve) => {
     const onUnauthorized = () => {
-      gate.hidden = false;
-      errorEl.textContent = 'Session expired — enter the code again';
-      errorEl.hidden = false;
+      openAuthGate(gate);
+      const errorEl = $('#auth-error', gate);
+      if (errorEl) {
+        errorEl.textContent = 'Session expired — enter your recovery phrase again';
+        errorEl.hidden = false;
+      }
       resolve(false);
     };
 
     window.addEventListener('lingo:unauthorized', onUnauthorized, { once: true });
 
-    form.onsubmit = async (e) => {
-      e.preventDefault();
-      errorEl.hidden = true;
-      submitBtn.disabled = true;
-
-      try {
-        const password = input.value.trim();
-        const res = await fetch('/api/auth/verify', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password }),
-        });
-        const data = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-          errorEl.textContent = data.error || 'Wrong access code';
-          errorEl.hidden = false;
-          return;
-        }
-
-        setAuthToken(password);
-        if (data.user) {
-          setStoredUser(data.user);
-          state.user = data.user;
-        }
-        gate.hidden = true;
-        void refreshUserSession();
+    const observer = new MutationObserver(() => {
+      if (gate.hidden) {
+        observer.disconnect();
         window.removeEventListener('lingo:unauthorized', onUnauthorized);
-        resolve(true);
-      } catch {
-        errorEl.textContent = 'Could not connect — try again';
-        errorEl.hidden = false;
-      } finally {
-        submitBtn.disabled = false;
+        resolve(Boolean(getAuthToken()));
       }
-    };
+    });
+    observer.observe(gate, { attributes: true, attributeFilter: ['hidden'] });
   });
 }
 
@@ -684,10 +773,7 @@ async function loadLanguages() {
     if (!res.ok) throw new Error('Failed to load languages');
     state.languages = await res.json();
   } catch {
-    state.languages = [
-      { code: 'en', name: 'English' },
-      { code: 'es', name: 'Spanish' },
-    ];
+    state.languages = [...OFFLINE_LANGUAGES];
   }
 }
 
@@ -765,7 +851,7 @@ function restoreSavedLanguages() {
   }
 
   // Language list may still be the offline fallback — trust saved pair anyway.
-  if (state.languages.length <= 2) {
+  if (state.languages.length <= OFFLINE_LANGUAGES.length) {
     state.lang1 = saved.lang1;
     state.lang2 = saved.lang2;
     return true;
@@ -775,7 +861,7 @@ function restoreSavedLanguages() {
 }
 
 async function ensureLanguagesLoaded() {
-  if (state.languages.length > 2) return;
+  if (state.languages.length > OFFLINE_LANGUAGES.length) return;
 
   try {
     const res = await apiFetch('/api/languages');
@@ -980,12 +1066,51 @@ function isRecordingUiActive() {
 
 function setRecordingUI(active) {
   composeBoxEl?.classList.toggle('is-recording', Boolean(active));
+  if (active) {
+    requestAnimationFrame(() => {
+      ensureComposeLevelBars(true);
+      observeComposeWaveResize();
+    });
+  } else {
+    composeMicWave.unobserveWaveResize();
+  }
+}
+
+function ensureComposeLevelBars(force = false) {
+  const toolbar = composeLevelEl?.closest('.compose-toolbar');
+  composeMicWave.ensureLevelBars(composeLevelEl, toolbar, force);
+}
+
+function observeComposeWaveResize() {
+  const toolbar = composeLevelEl?.closest('.compose-toolbar');
+  composeMicWave.observeWaveResize(composeLevelEl, toolbar, () => state.isRecording);
+}
+
+function applyMicVoicePulse() {
+  const toolbar = composeLevelEl?.closest('.compose-toolbar');
+  composeMicWave.applyMicVoicePulse(composeLevelEl, toolbar);
+}
+
+function clearMicVoicePulse() {
+  composeMicWave.clearMicVoicePulse();
+}
+
+function teardownMicMeter() {
+  composeMicWave.teardownMicMeter();
+}
+
+function prepareMicMeter(stream) {
+  composeMicWave.prepareMicMeter(stream);
+}
+
+function primeMicAudioOnGesture() {
+  composeMicWave.primeMicAudioOnGesture();
 }
 
 function updateComposeState() {
   const ready = languagesReady();
   const recordingUi = isRecordingUiActive();
-  const busy = recordingUi || state.isRecording || state.isProcessing || state.stoppingRecording;
+  const busy = recordingUi || state.isRecording || state.isProcessing || state.stoppingRecording || composeLoadingActive;
   const hasText = Boolean(getDraftText());
   const canUseDraftActions = hasText && !busy;
 
@@ -995,7 +1120,6 @@ function updateComposeState() {
   dictationTranslateBtn.hidden = !canUseDraftActions;
   dictationTranslateBtn.disabled = !canUseDraftActions;
   dictationTranslateBtn.classList.toggle('is-ready', canUseDraftActions);
-  composeBoxEl?.classList.toggle('has-draft-actions', canUseDraftActions);
   recordingCancelBtn.disabled = state.stoppingRecording;
   recordingSendBtn.disabled = !state.isRecording || state.stoppingRecording;
   dictationInputEl.disabled = recordingUi || state.isRecording || state.isProcessing;
@@ -1062,10 +1186,7 @@ function syncComposeCaret() {
   const recording = isRecordingUiActive() || state.isRecording || state.isProcessing;
   const focused = document.activeElement === ta;
 
-  wrap.classList.toggle('is-focused', focused);
-  wrap.classList.toggle('is-empty', !ta.value);
-
-  if (recording || ta.disabled || !focused) {
+  if (recording || ta.disabled || !focused || composeLoadingActive) {
     caret.hidden = true;
     getComposeCaretTyping()?.reset();
     return;
@@ -1219,7 +1340,10 @@ function bindDictation() {
   dictationInputEl.addEventListener('touchend', () => {
     requestAnimationFrame(syncComposeCaret);
   }, { passive: true });
-  dictationInputEl.addEventListener('scroll', syncComposeCaret, { passive: true });
+  dictationInputEl.addEventListener('scroll', () => {
+    syncComposeCaret();
+    syncComposeLoadingDots();
+  }, { passive: true });
   document.addEventListener('selectionchange', () => {
     if (document.activeElement === dictationInputEl) syncComposeCaret();
   });
@@ -1237,6 +1361,7 @@ function bindDictation() {
   window.addEventListener('resize', () => {
     resizeDictationInput();
     syncComposeCaret();
+    syncComposeLoadingDots();
   }, { passive: true });
 }
 
@@ -1412,11 +1537,6 @@ async function ensureMicStream() {
   return state.mediaStream;
 }
 
-function getMimeType() {
-  const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'];
-  return types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
-}
-
 function estimateProcessingMs(recordingMs, blobBytes) {
   const MIN_MS = 2500;
   const MAX_MS = 7500;
@@ -1435,305 +1555,8 @@ function estimateTranscribeMs(recordingMs, blobBytes) {
   return Math.round(MIN_MS + t * (MAX_MS - MIN_MS));
 }
 
-function simulatedProgress(elapsedMs, estimateMs = progressEstimateMs) {
-  const target = estimateMs;
-  const ratio = elapsedMs / target;
-
-  if (ratio <= 1) return ratio * 97;
-
-  const overtime = elapsedMs - target;
-  return Math.min(97 + (overtime / (target * 0.6)) * 2, 99);
-}
-
-function updateMicTranscribeProgress(pct) {
-  if (!composeMicProgressFill) return;
-  const offset = COMPOSE_MIC_RING_CIRCUMFERENCE * (1 - pct / 100);
-  composeMicProgressFill.style.strokeDashoffset = String(offset);
-  composeMicProgressFill.style.stroke = rgbCss(processingRgb(pct));
-}
-
-function startMicTranscribeProgress(recordingMs, blobBytes) {
-  stopMicTranscribeProgress();
-  transcribeProgressEstimateMs = estimateTranscribeMs(recordingMs, blobBytes);
-  transcribeProgressStartedAt = performance.now();
-  composeMicBtn?.classList.add('is-transcribing');
-  composeMicBtn?.setAttribute('aria-busy', 'true');
-  composeMicBtn?.setAttribute('aria-label', 'Transcribing audio');
-  updateMicTranscribeProgress(0);
-
-  const tick = (now) => {
-    const elapsed = now - transcribeProgressStartedAt;
-    updateMicTranscribeProgress(simulatedProgress(elapsed, transcribeProgressEstimateMs));
-    transcribeProgressRaf = requestAnimationFrame(tick);
-  };
-
-  transcribeProgressRaf = requestAnimationFrame(tick);
-}
-
-function stopMicTranscribeProgress() {
-  if (transcribeProgressRaf) cancelAnimationFrame(transcribeProgressRaf);
-  transcribeProgressRaf = null;
-
-  composeMicBtn?.classList.remove('is-transcribing');
-  composeMicBtn?.removeAttribute('aria-busy');
-  composeMicBtn?.setAttribute('aria-label', 'Record message');
-
-  if (composeMicProgressFill) {
-    composeMicProgressFill.style.strokeDashoffset = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
-    composeMicProgressFill.style.removeProperty('stroke');
-  }
-}
-
-const PROCESSING_COLOR_STOPS = [
-  { at: 0, r: 248, g: 113, b: 113 },
-  { at: 0.28, r: 251, g: 146, b: 60 },
-  { at: 0.55, r: 251, g: 191, b: 36 },
-  { at: 0.78, r: 163, g: 230, b: 53 },
-  { at: 1, r: 74, g: 222, b: 128 },
-];
-
-function lerp(a, b, t) {
-  return a + (b - a) * t;
-}
-
-function processingRgb(pct) {
-  const t = Math.max(0, Math.min(1, pct / 100));
-  let start = PROCESSING_COLOR_STOPS[0];
-  let end = PROCESSING_COLOR_STOPS[PROCESSING_COLOR_STOPS.length - 1];
-
-  for (let i = 0; i < PROCESSING_COLOR_STOPS.length - 1; i++) {
-    if (t >= PROCESSING_COLOR_STOPS[i].at && t <= PROCESSING_COLOR_STOPS[i + 1].at) {
-      start = PROCESSING_COLOR_STOPS[i];
-      end = PROCESSING_COLOR_STOPS[i + 1];
-      const span = end.at - start.at || 1;
-      const local = (t - start.at) / span;
-      return {
-        r: Math.round(lerp(start.r, end.r, local)),
-        g: Math.round(lerp(start.g, end.g, local)),
-        b: Math.round(lerp(start.b, end.b, local)),
-      };
-    }
-  }
-
-  return { r: end.r, g: end.g, b: end.b };
-}
-
-function rgbCss({ r, g, b }, alpha = 1) {
-  return alpha === 1 ? `rgb(${r}, ${g}, ${b})` : `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
-
-function applyProcessingVisuals(_pct) {
-  // Progress visuals handled via .compose-box.is-processing
-}
-
-function clearProcessingVisuals() {
-  composeBoxEl?.classList.remove('is-processing');
-}
-
-function updateProgressRing(_pct) {
-  // Legacy no-op — progress ring removed
-}
-
-function getMicMeterContext() {
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  if (!Ctx) return null;
-  if (!micMeterCtx || micMeterCtx.state === 'closed') {
-    micMeterCtx = new Ctx();
-  }
-  return micMeterCtx;
-}
-
-function primeMicAudioOnGesture() {
-  const ctx = getMicMeterContext();
-  if (!ctx || ctx.state !== 'suspended') return;
-  void ctx.resume();
-}
-
-function prepareMicMeter(stream) {
-  if (micMeter?.stream === stream) {
-    const ctx = getMicMeterContext();
-    if (ctx?.state === 'suspended') void ctx.resume();
-    return;
-  }
-
-  teardownMicMeter();
-
-  const ctx = getMicMeterContext();
-  if (!ctx || !stream?.active) return;
-
-  const source = ctx.createMediaStreamSource(stream);
-  const analyser = ctx.createAnalyser();
-  analyser.fftSize = 256;
-  analyser.smoothingTimeConstant = 0.12;
-  const silentGain = ctx.createGain();
-  silentGain.gain.value = 0;
-
-  source.connect(analyser);
-  analyser.connect(silentGain);
-  silentGain.connect(ctx.destination);
-
-  micMeter = {
-    stream,
-    source,
-    analyser,
-    silentGain,
-    timeData: new Uint8Array(analyser.fftSize),
-    freqData: new Uint8Array(analyser.frequencyBinCount),
-    smooth: 0,
-  };
-
-  if (ctx.state !== 'running') void ctx.resume();
-}
-
-function readMicLevel() {
-  if (!micMeter) return 0;
-
-  micMeter.analyser.getByteTimeDomainData(micMeter.timeData);
-  micMeter.analyser.getByteFrequencyData(micMeter.freqData);
-
-  let sum = 0;
-  for (let i = 0; i < micMeter.timeData.length; i++) {
-    const sample = (micMeter.timeData[i] - 128) / 128;
-    sum += sample * sample;
-  }
-  const rms = Math.sqrt(sum / micMeter.timeData.length);
-
-  let peak = 0;
-  for (let i = 0; i < micMeter.freqData.length; i++) {
-    if (micMeter.freqData[i] > peak) peak = micMeter.freqData[i];
-  }
-  const freqLevel = peak / 255;
-
-  const raw = Math.min(1, Math.max(rms * 4.8, freqLevel * 1.45));
-  const ease = raw > micMeter.smooth ? 0.88 : 0.22;
-  micMeter.smooth += (raw - micMeter.smooth) * ease;
-  return micMeter.smooth;
-}
-
-function isMobileMicWave() {
-  return mobileMicWavePreferred;
-}
-
-function ensureComposeLevelBars() {
-  if (!composeLevelEl) return;
-  if (micWaveScrollEl && micWaveBarEls.length === MIC_WAVE_TOTAL) return;
-
-  composeLevelEl.style.setProperty('--compose-wave-visible', String(COMPOSE_WAVE_VISIBLE));
-  composeLevelEl.innerHTML = '';
-  micWaveBarEls.length = 0;
-  micWaveScrollEl = document.createElement('span');
-  micWaveScrollEl.className = 'compose-level-scroll';
-  composeLevelEl.appendChild(micWaveScrollEl);
-
-  micWaveSlots = Array(MIC_WAVE_TOTAL).fill(MIC_BAR_IDLE);
-  for (let i = 0; i < MIC_WAVE_TOTAL; i++) {
-    const bar = document.createElement('span');
-    bar.className = 'compose-level-bar';
-    bar.style.setProperty('--bar-scale', String(MIC_BAR_IDLE));
-    micWaveScrollEl.appendChild(bar);
-    micWaveBarEls.push(bar);
-  }
-}
-
-function isMicSilent(level) {
-  if (!micMeter) return true;
-
-  micMeter.analyser.getByteTimeDomainData(micMeter.timeData);
-  let sum = 0;
-  for (let i = 0; i < micMeter.timeData.length; i++) {
-    const sample = (micMeter.timeData[i] - 128) / 128;
-    sum += sample * sample;
-  }
-  const instant = Math.sqrt(sum / micMeter.timeData.length);
-  return level < MIC_VOICE_GATE && instant < 0.025;
-}
-
-function computeWaveSample(level, silent) {
-  if (silent || !micMeter) return MIC_BAR_IDLE;
-
-  micMeter.analyser.getByteFrequencyData(micMeter.freqData);
-  const voiceBins = Math.max(8, Math.floor(micMeter.freqData.length * 0.4));
-  let peak = 0;
-  for (let b = 2; b < 2 + voiceBins; b++) {
-    peak = Math.max(peak, micMeter.freqData[b] / 255);
-  }
-
-  const gated = Math.max(0, peak - MIC_BAR_TRIGGER) / (1 - MIC_BAR_TRIGGER);
-  if (gated < 0.07) return MIC_BAR_IDLE;
-
-  const voiceLevel = Math.max(gated, Math.max(0, level - MIC_VOICE_GATE) * 0.55);
-  const compressed = Math.pow(Math.min(1, voiceLevel * 0.82), 1.8);
-  return MIC_BAR_IDLE + compressed * (1 - MIC_BAR_IDLE);
-}
-
-function finishMicWaveShift() {
-  if (!micWaveScrollEl || !micWaveBarEls.length) return;
-
-  const first = micWaveBarEls.shift();
-  first.style.setProperty('--bar-scale', String(MIC_BAR_IDLE));
-  micWaveScrollEl.appendChild(first);
-  micWaveBarEls.push(first);
-
-  micWaveScrollEl.style.transition = 'none';
-  micWaveScrollEl.style.transform = 'translateX(0)';
-  micWaveShiftBusy = false;
-}
-
-function shiftMicWaveform(sample) {
-  if (!micWaveScrollEl || !micWaveBarEls.length || micWaveShiftBusy) return;
-
-  micWaveShiftBusy = true;
-  micWaveSlots.shift();
-  micWaveSlots.push(sample);
-
-  const incoming = micWaveBarEls[micWaveBarEls.length - 1];
-  incoming.style.setProperty('--bar-scale', sample.toFixed(3));
-
-  micWaveScrollEl.style.transition = `transform ${MIC_WAVE_SHIFT_MS}ms linear`;
-  micWaveScrollEl.style.transform = `translateX(-${MIC_WAVE_BAR_STEP}px)`;
-
-  window.setTimeout(finishMicWaveShift, MIC_WAVE_SHIFT_MS);
-}
-
-function applyMicVoicePulse() {
-  ensureComposeLevelBars();
-  if (!micMeter) return;
-
-  const now = performance.now();
-  if (now - micWaveLastShift < MIC_WAVE_SHIFT_MS || micWaveShiftBusy) return;
-  micWaveLastShift = now;
-
-  const level = readMicLevel();
-  const silent = isMicSilent(level);
-  if (silent && micMeter) micMeter.smooth *= 0.62;
-  const sample = computeWaveSample(level, silent);
-  shiftMicWaveform(sample);
-}
-
-function clearMicVoicePulse() {
-  micWaveLastShift = 0;
-  micWaveShiftBusy = false;
-  if (!micWaveBarEls.length) return;
-  micWaveSlots = Array(micWaveBarEls.length).fill(MIC_BAR_IDLE);
-  micWaveBarEls.forEach((bar) => {
-    bar.style.setProperty('--bar-scale', String(MIC_BAR_IDLE));
-  });
-  if (micWaveScrollEl) {
-    micWaveScrollEl.style.transition = 'none';
-    micWaveScrollEl.style.transform = 'translateX(0)';
-  }
-}
-
-function teardownMicMeter() {
-  try {
-    micMeter?.source?.disconnect();
-    micMeter?.analyser?.disconnect();
-    micMeter?.silentGain?.disconnect();
-  } catch {
-    // ignore disconnect errors
-  }
-  micMeter = null;
-  clearMicVoicePulse();
+function loadingDotCapFromMs(ms) {
+  return Math.min(LOADING_DOT_MAX, Math.max(4, Math.ceil(ms / LOADING_DOT_MS)));
 }
 
 function cancelRecordingProgressRaf() {
@@ -1743,13 +1566,13 @@ function cancelRecordingProgressRaf() {
 
 function resetRecordingSendProgress() {
   if (!recordingSendProgressFill) return;
-  recordingSendProgressFill.style.strokeDashoffset = String(COMPOSE_MIC_RING_CIRCUMFERENCE);
+  recordingSendProgressFill.style.strokeDashoffset = String(RECORDING_SEND_RING_CIRCUMFERENCE);
 }
 
 function updateRecordingSendProgress(pct) {
   if (!recordingSendProgressFill) return;
   const clamped = Math.min(100, Math.max(0, pct));
-  const offset = COMPOSE_MIC_RING_CIRCUMFERENCE * (1 - clamped / 100);
+  const offset = RECORDING_SEND_RING_CIRCUMFERENCE * (1 - clamped / 100);
   recordingSendProgressFill.style.strokeDashoffset = String(offset);
 }
 
@@ -1761,7 +1584,6 @@ function stopRecordingProgress() {
 
 async function startRecordingProgress() {
   cancelRecordingProgressRaf();
-  stopProgress();
   updateRecordingSendProgress(0);
 
   const tick = () => {
@@ -1784,38 +1606,6 @@ async function startRecordingProgress() {
   };
 
   recordingProgressRaf = requestAnimationFrame(tick);
-}
-
-function startProgress(estimatedMs) {
-  streamProgressFinished = false;
-  stopRecordingProgress();
-  stopProgress();
-  progressEstimateMs = estimatedMs;
-  progressStartedAt = performance.now();
-  composeBoxEl?.classList.add('is-processing');
-
-  const tick = (now) => {
-    const elapsed = now - progressStartedAt;
-    updateProgressRing(simulatedProgress(elapsed));
-    progressRaf = requestAnimationFrame(tick);
-  };
-
-  progressRaf = requestAnimationFrame(tick);
-}
-
-function finishProgress() {
-  return new Promise((resolve) => {
-    stopProgress();
-    setTimeout(() => {
-      resolve();
-    }, 220);
-  });
-}
-
-function stopProgress() {
-  if (progressRaf) cancelAnimationFrame(progressRaf);
-  progressRaf = null;
-  clearProcessingVisuals();
 }
 
 function buildConversationContext() {
@@ -1914,34 +1704,129 @@ function maxLoadingDots(textLength) {
   return Math.min(LOADING_DOT_MAX, Math.max(3, Math.ceil(chars / 12)));
 }
 
-function stopLoadingDots() {
-  if (loadingDotsTimer) clearInterval(loadingDotsTimer);
-  loadingDotsTimer = null;
+let activeTranslationDotsEl = null;
+
+function stopLoadingDots(dotsEl) {
+  if (!dotsEl) return;
+  if (dotsEl._dotsTimer) {
+    clearInterval(dotsEl._dotsTimer);
+    dotsEl._dotsTimer = null;
+  }
+  dotsEl.textContent = '';
 }
 
-function startLoadingDots(hostEl, textLength) {
-  stopLoadingDots();
-  const dotsEl = hostEl?.querySelector('.translation-loading-dots');
+function animateLoadingDots(dotsEl, {
+  cap = LOADING_DOT_MAX,
+  shouldContinue,
+  onTick,
+  initialCount = 1,
+} = {}) {
   if (!dotsEl) return;
 
-  const cap = maxLoadingDots(textLength);
-  let dotCount = 0;
-  dotsEl.textContent = '';
+  if (dotsEl._dotsTimer) {
+    clearInterval(dotsEl._dotsTimer);
+    dotsEl._dotsTimer = null;
+  }
 
-  loadingDotsTimer = window.setInterval(() => {
-    const message = state.messages[0];
-    if (!message?._loading) {
-      stopLoadingDots();
+  let dotCount = Math.max(1, initialCount);
+  dotsEl.textContent = '.'.repeat(dotCount);
+  onTick?.();
+
+  dotsEl._dotsTimer = window.setInterval(() => {
+    if (shouldContinue && !shouldContinue()) {
+      stopLoadingDots(dotsEl);
       return;
     }
     if (dotCount >= cap) return;
     dotCount += 1;
-    dotsEl.textContent += '.';
+    dotsEl.textContent = '.'.repeat(dotCount);
+    onTick?.();
   }, LOADING_DOT_MS);
+}
+
+function syncComposeLoadingDots() {
+  if (!composeLoadingActive || !composeLoadingDotsEl || composeLoadingDotsEl.hasAttribute('hidden')) return;
+
+  const wrap = composeInputWrapEl;
+  const ta = dictationInputEl;
+  if (!wrap || !ta) return;
+
+  const mirror = ensureComposeCaretMirror();
+  const style = getComputedStyle(ta);
+  mirror.style.width = `${ta.clientWidth}px`;
+  mirror.style.font = style.font;
+  mirror.style.fontSize = style.fontSize;
+  mirror.style.fontFamily = style.fontFamily;
+  mirror.style.fontWeight = style.fontWeight;
+  mirror.style.lineHeight = style.lineHeight;
+  mirror.style.letterSpacing = style.letterSpacing;
+  mirror.style.padding = style.padding;
+  mirror.style.border = style.border;
+  mirror.style.boxSizing = style.boxSizing;
+
+  const textBefore = ta.value;
+  const needsSpace = textBefore.length > 0 && !/\s$/.test(textBefore);
+  const markerText = `${textBefore}${needsSpace ? ' ' : ''}`;
+
+  mirror.replaceChildren();
+  mirror.append(document.createTextNode(markerText));
+  const marker = document.createElement('span');
+  marker.textContent = '\u200b';
+  mirror.append(marker);
+
+  const markerRect = marker.getBoundingClientRect();
+  const wrapRect = wrap.getBoundingClientRect();
+
+  composeLoadingDotsEl.style.left = `${markerRect.left - wrapRect.left}px`;
+  composeLoadingDotsEl.style.top = `${markerRect.top - wrapRect.top + ta.scrollTop}px`;
+}
+
+function startComposeLoadingDots(dotCap = 12) {
+  composeLoadingActive = true;
+  composeLoadingDotsEl?.removeAttribute('hidden');
+  composeLoadingDotsEl?.removeAttribute('aria-hidden');
+  composeLoadingDotsEl?.setAttribute('aria-live', 'polite');
+  dictationInputEl?.setAttribute('aria-busy', 'true');
+  composeBoxEl?.classList.add('is-processing');
+  updateComposeState();
+  syncComposeLoadingDots();
+  animateLoadingDots(composeLoadingDotsEl, {
+    cap: dotCap,
+    shouldContinue: () => composeLoadingActive,
+    onTick: syncComposeLoadingDots,
+  });
+}
+
+function stopComposeLoadingDots() {
+  composeLoadingActive = false;
+  composeLoadingDotsEl?.setAttribute('hidden', '');
+  composeLoadingDotsEl?.setAttribute('aria-hidden', 'true');
+  composeLoadingDotsEl?.removeAttribute('aria-live');
+  dictationInputEl?.removeAttribute('aria-busy');
+  stopLoadingDots(composeLoadingDotsEl);
+  composeBoxEl?.classList.remove('is-processing');
+  updateComposeState();
+}
+
+function startTranslationLoadingDots(card, message) {
+  const dotsEl = card?.querySelector('.translation-loading-dots');
+  if (!dotsEl || !message) return;
+
+  activeTranslationDotsEl = dotsEl;
+  animateLoadingDots(dotsEl, {
+    cap: LOADING_DOT_MAX,
+    initialCount: message._loadingDotCount || 1,
+    shouldContinue: () => Boolean(message._loading && !message.translated),
+    onTick: () => {
+      message._loadingDotCount = dotsEl.textContent.length;
+    },
+  });
 }
 
 function showStreamingTranscript(rawText, requestId) {
   if (requestId !== undefined && requestId !== latestTranslationRequest) return;
+
+  stopComposeLoadingDots();
 
   const existing = state.messages[0];
   if (existing?._streaming && existing.id === `stream-${requestId}`) {
@@ -1973,8 +1858,9 @@ function appendStreamingTranslation(text, requestId) {
 
   const translatedEl = getMessageCardEl(message)?.querySelector('.message-translated-text');
   if (message._loading) {
-    stopLoadingDots();
+    stopLoadingDots(translatedEl?.querySelector('.translation-loading-dots'));
     message._loading = false;
+    message._loadingDotCount = 0;
     if (translatedEl) {
       translatedEl.classList.remove('is-loading');
       translatedEl.removeAttribute('aria-busy');
@@ -2343,8 +2229,7 @@ async function processPendingQueue() {
     if (state.isRecording) return;
 
     state.isProcessing = true;
-    composeBoxEl.classList.add('is-processing');
-    startProgress(estimateProcessingMs(item.recordingMs, item.blob?.size || 0));
+    startComposeLoadingDots(loadingDotCapFromMs(estimateProcessingMs(item.recordingMs, item.blob?.size || 0)));
 
     const context = JSON.parse(item.contextJson || '[]');
     const data = await submitRecording({
@@ -2369,7 +2254,6 @@ async function processPendingQueue() {
         recordingMs: item.recordingMs,
       },
     });
-    if (!streamProgressFinished) await finishProgress();
   } catch (err) {
     if (err?.name === 'AbortError') return;
     if (err.retryable !== false) {
@@ -2459,7 +2343,6 @@ async function beginRecording() {
   stopPlayback();
   clearMicVoicePulse();
   state.audioChunks = [];
-  ensureComposeLevelBars();
   setRecordingUI(true);
   updateComposeState();
 
@@ -2472,7 +2355,7 @@ async function beginRecording() {
 
     prepareMicMeter(stream);
 
-    const mimeType = getMimeType();
+    const mimeType = getRecordingMimeType();
     state.mediaRecorder = mimeType
       ? new MediaRecorder(stream, { mimeType })
       : new MediaRecorder(stream);
@@ -2561,26 +2444,17 @@ async function acceptRecording({ autoLimit = false } = {}) {
 
     pendingSourceRecording = { blob, mimeType, recordingMs };
 
-    composeBoxEl.classList.add('is-processing');
     updateComposeState();
-    startMicTranscribeProgress(recordingMs, blob.size);
+    startComposeLoadingDots(loadingDotCapFromMs(estimateTranscribeMs(recordingMs, blob.size)));
 
     let transcript = '';
-    let transcribeOk = false;
     try {
       transcript = await fetchTranscriptFromAudio({ blob, mimeType });
-      transcribeOk = true;
     } catch (err) {
       showToast(err.message || 'Could not transcribe audio');
       return;
     } finally {
-      if (transcribeOk) {
-        if (transcribeProgressRaf) cancelAnimationFrame(transcribeProgressRaf);
-        transcribeProgressRaf = null;
-        updateMicTranscribeProgress(100);
-      }
-      stopMicTranscribeProgress();
-      composeBoxEl.classList.remove('is-processing');
+      stopComposeLoadingDots();
     }
 
     if (!transcript.trim()) {
@@ -2643,8 +2517,7 @@ function releaseMic() {
 }
 
 function resetMicUI() {
-  stopProgress();
-  stopMicTranscribeProgress();
+  stopComposeLoadingDots();
   stopLoadingDots();
   stopRecordingProgress();
   cleanupRecorder();
@@ -2652,36 +2525,8 @@ function resetMicUI() {
   state.stoppingRecording = false;
   state.isRecording = false;
   setRecordingUI(false);
-  clearProcessingVisuals();
   updateComposeState();
 }
-
-async function playTranslation(msg, btn) {
-  if (btn?.dataset.busy === '1') return;
-
-  releaseActionButtonFocus(btn?.closest('.message-card')?.querySelector('.copy-btn, .share-btn'));
-  if (btn) btn.dataset.busy = '1';
-  stopPlayback();
-
-  btn?.classList.add('playing');
-  if (btn) btn.disabled = true;
-
-  try {
-    if (!msg.audioUrl) {
-      await loadMessageAudio(msg);
-    }
-    if (!msg.audioUrl) throw new Error('Audio not ready — tap Listen again');
-    await playAudioUrl(msg.audioUrl);
-  } catch (err) {
-    if (err?.name !== 'AbortError') {
-      cancelMessageAudio(msg);
-      showToast(err.message);
-    }
-  } finally {
-    if (btn) resetListenBtn(btn);
-  }
-}
-
 async function blobFromAudioUrl(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error('Could not read audio');
@@ -2690,6 +2535,8 @@ async function blobFromAudioUrl(url) {
 
 async function shareClonedAudio(msg, btn) {
   if (btn?.dataset.busy === '1') return;
+
+  acknowledgeActionButton(btn);
   if (btn) {
     btn.dataset.busy = '1';
     btn.disabled = true;
@@ -2743,25 +2590,38 @@ function createMessageCard(msg) {
   el.dataset.messageId = String(msg.id);
   const hideActions = msg._streaming || msg._loading;
 
+  const hasAudio = Boolean(msg.audioUrl);
+  const audioActionsClass = hasAudio ? ' has-audio-actions' : '';
+
   el.innerHTML = `
     <div class="message-bubble">
       <div class="message-translated message-translated-only">
         ${renderTranslatedContent(msg)}
       </div>
-      <div class="message-footer-actions"${hideActions ? ' hidden' : ''}>
-        <button type="button" class="icon-btn share-btn share-btn-inline" title="Share text" aria-label="Share text">
-          ${SHARE_BTN_SVG}
-        </button>
-        <div class="message-actions-listen"${msg.audioUrl ? '' : ' hidden'}>
-          <button type="button" class="icon-btn listen-btn listen-btn-inline" title="Listen" aria-label="Listen">
-            ${LISTEN_BTN_SVG}
+      <div class="message-footer-actions${audioActionsClass}"${hideActions ? ' hidden' : ''}>
+        <div class="message-footer-left">
+          <button type="button" class="icon-btn share-btn share-btn-inline" title="Share" aria-label="Share">
+            ${SHARE_BTN_SVG}
           </button>
-          <button type="button" class="icon-btn share-audio-btn" title="Share audio" aria-label="Share audio">
-            ${SHARE_AUDIO_BTN_SVG}
+          <button type="button" class="icon-btn copy-btn copy-btn-inline" title="Copy as text" aria-label="Copy as text">
+            ${COPY_BTN_SVG}
           </button>
         </div>
-        <button type="button" class="icon-btn copy-btn copy-btn-inline" title="Copy" aria-label="Copy">
-          ${COPY_BTN_SVG}
+        <div class="message-playback-slot"${hasAudio ? '' : ' hidden'}>
+          <div class="message-playback-side message-playback-side-left">
+            <button type="button" class="icon-btn playback-seek-btn playback-restart-btn" hidden title="Start from beginning" aria-label="Start from beginning">
+              ${RESTART_PLAYBACK_BTN_SVG}
+            </button>
+          </div>
+          <button type="button" class="icon-btn listen-btn listen-btn-inline" title="Play" aria-label="Play">
+            ${PLAY_BTN_SVG}
+          </button>
+          <div class="message-playback-side message-playback-side-right" hidden aria-hidden="true">
+            <span class="playback-side-spacer"></span>
+          </div>
+        </div>
+        <button type="button" class="icon-btn share-audio-btn share-audio-btn-end"${hasAudio ? '' : ' hidden'} title="Share audio" aria-label="Share audio">
+          ${SHARE_AUDIO_BTN_SVG}
         </button>
       </div>
     </div>
@@ -2772,17 +2632,25 @@ function createMessageCard(msg) {
     el.querySelector('.share-audio-btn')?.classList.add('is-ready');
   }
 
+  syncListenBtnVoiceMode(msg);
+
   const listenBtn = el.querySelector('.listen-btn');
   const shareAudioBtn = el.querySelector('.share-audio-btn');
   const copyBtn = el.querySelector('.copy-btn');
   const shareBtn = el.querySelector('.share-btn');
+  const restartBtn = el.querySelector('.playback-restart-btn');
 
-  listenBtn?.addEventListener('click', () => playTranslation(msg, listenBtn));
+  listenBtn?.addEventListener('click', () => void toggleTranslationAudio(msg, listenBtn));
   shareAudioBtn?.addEventListener('click', () => void shareClonedAudio(msg, shareAudioBtn));
+  restartBtn?.addEventListener('click', () => {
+    acknowledgeActionButton(restartBtn);
+    restartActivePlayback(msg);
+  });
   copyBtn?.addEventListener('click', async () => {
+    acknowledgeActionButton(copyBtn);
     try {
       await navigator.clipboard.writeText(msg.translated);
-      showToast('Copied!');
+      showToast('Copied as text');
     } catch {
       showToast('Could not copy');
     } finally {
@@ -2795,7 +2663,11 @@ function createMessageCard(msg) {
 }
 
 function renderConversation() {
-  stopLoadingDots();
+  if (activeTranslationDotsEl) {
+    stopLoadingDots(activeTranslationDotsEl);
+    activeTranslationDotsEl = null;
+  }
+
   currentMessageEl.innerHTML = '';
 
   if (!state.messages.length) {
@@ -2808,7 +2680,7 @@ function renderConversation() {
   currentMessageEl.appendChild(card);
 
   if (latest._loading) {
-    startLoadingDots(card.querySelector('.message-translated-text'), latest.original?.length || 0);
+    startTranslationLoadingDots(card, latest);
   }
 }
 
@@ -2817,12 +2689,6 @@ function showToast(message) {
   toastEl.hidden = false;
   clearTimeout(showToast._timer);
   showToast._timer = setTimeout(() => { toastEl.hidden = true; }, 6000);
-}
-
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
 }
 
 function bindEvents() {
@@ -2837,3 +2703,4 @@ function bindEvents() {
 }
 
 init();
+registerPwa();

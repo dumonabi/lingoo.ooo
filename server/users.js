@@ -1,77 +1,107 @@
 import crypto from 'crypto';
+import { generateMnemonic, validateMnemonic } from '@scure/bip39';
+import { wordlist } from '@scure/bip39/wordlists/english.js';
+import {
+  addStoredUser,
+  ensureUserRegistryLoaded,
+  findStoredUserById,
+  getCachedUserRegistry,
+} from './user-store.js';
+import {
+  hashPassphrase,
+  normalizePassphrase,
+  verifyPassphrase,
+} from './passphrase.js';
+import {
+  getSuperUserRecord,
+  verifySuperUserPassword,
+} from './bootstrap-user.js';
 
-function timingSafeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
+function createUserId() {
+  return `u-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
 }
 
-export function getLegacyAppPassword() {
-  return process.env.APP_PASSWORD?.trim() || null;
-}
-
-export function loadUserRegistry() {
-  const users = [];
-  const raw = process.env.APP_USERS?.trim();
-
-  if (raw) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        for (const entry of parsed) {
-          const password = entry?.password?.trim();
-          const id = entry?.id?.trim();
-          const name = entry?.name?.trim();
-          if (!password || !id || !name) continue;
-          users.push({
-            password,
-            id,
-            name,
-            nativeLanguage: entry.nativeLanguage?.trim()?.toLowerCase() || 'en',
-            elevenlabsVoiceId: entry.elevenlabsVoiceId?.trim() || null,
-          });
-        }
-      }
-    } catch (err) {
-      console.error('Invalid APP_USERS JSON:', err.message);
-    }
-  }
-
-  const legacy = getLegacyAppPassword();
-  if (legacy && !users.some((user) => timingSafeEqual(user.password, legacy))) {
-    users.unshift({
-      id: 'owner',
-      name: 'You',
-      password: legacy,
-      nativeLanguage: 'en',
-      elevenlabsVoiceId: null,
-    });
-  }
-
-  return users;
+function generateRecoveryPhrase() {
+  return generateMnemonic(wordlist, 128);
 }
 
 export function isAuthRequired() {
-  return loadUserRegistry().length > 0;
+  if (process.env.DISABLE_AUTH === '1') return false;
+  return true;
 }
 
-export function findUserByPassword(attempt) {
+function toPublicUser(record) {
+  return {
+    id: record.id,
+    name: record.name,
+    nativeLanguage: record.nativeLanguage || 'en',
+    elevenlabsVoiceId: record.elevenlabsVoiceId || null,
+  };
+}
+
+export async function findUserByPassphrase(attempt) {
+  await ensureUserRegistryLoaded();
   if (typeof attempt !== 'string' || !attempt) return null;
 
-  for (const user of loadUserRegistry()) {
-    if (timingSafeEqual(attempt, user.password)) {
-      return {
-        id: user.id,
-        name: user.name,
-        nativeLanguage: user.nativeLanguage || 'en',
-        elevenlabsVoiceId: user.elevenlabsVoiceId || null,
-      };
+  if (verifySuperUserPassword(attempt)) {
+    return toPublicUser(getSuperUserRecord());
+  }
+
+  const normalized = normalizePassphrase(attempt);
+  if (!normalized || !validateMnemonic(normalized, wordlist)) return null;
+
+  for (const user of getCachedUserRegistry()) {
+    if (user.passphraseHash && verifyPassphrase(normalized, user.passphraseHash)) {
+      return toPublicUser(user);
     }
   }
 
   return null;
+}
+
+export function findUserByPassphraseSync(attempt) {
+  if (typeof attempt !== 'string' || !attempt) return null;
+
+  if (verifySuperUserPassword(attempt)) {
+    return toPublicUser(getSuperUserRecord());
+  }
+
+  const normalized = normalizePassphrase(attempt);
+  if (!normalized || !validateMnemonic(normalized, wordlist)) return null;
+
+  for (const user of getCachedUserRegistry()) {
+    if (user.passphraseHash && verifyPassphrase(normalized, user.passphraseHash)) {
+      return toPublicUser(user);
+    }
+  }
+
+  return null;
+}
+
+export async function getUserById(id) {
+  if (!id) return null;
+  const stored = await findStoredUserById(id);
+  return stored ? toPublicUser(stored) : null;
+}
+
+export async function createUser({ name }) {
+  const trimmedName = String(name || '').trim() || 'User';
+  const mnemonic = generateRecoveryPhrase();
+  const record = {
+    id: createUserId(),
+    name: trimmedName.slice(0, 48),
+    nativeLanguage: 'en',
+    elevenlabsVoiceId: null,
+    passphraseHash: hashPassphrase(mnemonic),
+    createdAt: Date.now(),
+  };
+
+  await addStoredUser(record);
+
+  return {
+    user: toPublicUser(record),
+    recoveryPhrase: mnemonic,
+  };
 }
 
 export function getGuestUser() {

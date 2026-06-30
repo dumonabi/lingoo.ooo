@@ -10,7 +10,13 @@ export function hideAllLangPickerCarets() {
   }
 }
 
-export function createLangPicker(container, { languages, value, onChange, placeholder = '', onFocusEdit } = {}) {
+export function createLangPicker(container, {
+  languages,
+  value,
+  onChange,
+  placeholder = '',
+  onFocusEdit,
+} = {}) {
   let selectedCode = value || '';
 
   const root = document.createElement('div');
@@ -21,6 +27,15 @@ export function createLangPicker(container, { languages, value, onChange, placeh
 
   const field = document.createElement('div');
   field.className = 'lang-picker-field';
+
+  const selectedRow = document.createElement('div');
+  selectedRow.className = 'lang-picker-selected-row';
+  selectedRow.setAttribute('aria-hidden', 'true');
+
+  const selectedName = document.createElement('span');
+  selectedName.className = 'lang-picker-selected-name';
+
+  selectedRow.append(selectedName);
 
   const mirror = document.createElement('div');
   mirror.className = 'compose-caret-mirror lang-picker-caret-mirror';
@@ -42,7 +57,7 @@ export function createLangPicker(container, { languages, value, onChange, placeh
   list.className = 'lang-picker-list';
   list.hidden = true;
 
-  field.append(mirror, caret, input);
+  field.append(selectedRow, mirror, caret, input);
   inputWrap.append(field);
   root.append(inputWrap, list);
   container.appendChild(root);
@@ -51,6 +66,7 @@ export function createLangPicker(container, { languages, value, onChange, placeh
     hideCaret() {
       caret.hidden = true;
       inputWrap.classList.remove('is-editing');
+      field.classList.remove('is-editing');
     },
   };
   langPickerRegistry.push(entry);
@@ -73,20 +89,25 @@ export function createLangPicker(container, { languages, value, onChange, placeh
   function renderList() {
     const items = filteredLanguages();
     list.innerHTML = items
-      .map(
-        (l) => `
+      .map((l) => `
       <li class="lang-picker-option${l.code === selectedCode ? ' selected' : ''}" data-code="${l.code}" role="option">
         <span class="lang-picker-name">${l.name}</span>
-      </li>`,
-      )
+      </li>`)
       .join('');
     list.hidden = items.length === 0;
+  }
+
+  function syncSelectedRow() {
+    const lang = findLang(selectedCode);
+    selectedName.textContent = lang?.name || '';
   }
 
   function syncCaret() {
     const focused = document.activeElement === input;
     inputWrap.classList.toggle('is-editing', focused);
+    field.classList.toggle('is-editing', focused);
     inputWrap.classList.toggle('is-empty', !input.value);
+    syncSelectedRow();
 
     if (!focused) {
       caret.hidden = true;
@@ -137,6 +158,7 @@ export function createLangPicker(container, { languages, value, onChange, placeh
     input.value = lang ? lang.name : '';
     input.placeholder = lang ? '' : placeholder;
     inputWrap.classList.remove('is-editing');
+    field.classList.remove('is-editing');
     list.hidden = true;
     syncCaret();
   }

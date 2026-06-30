@@ -16,11 +16,12 @@ export function measureCharCell(mirror, style) {
 
 export function positionBlockCaret(caret, { left, top, charWidth, lineHeight }) {
   const blockHeight = Math.max(lineHeight * 0.88, 12);
+  const blockWidth = charWidth * 0.75;
   const insetY = Math.max(0, (lineHeight - blockHeight) / 2);
 
   caret.style.left = `${left}px`;
   caret.style.top = `${top + insetY}px`;
-  caret.style.width = `${charWidth}px`;
+  caret.style.width = `${blockWidth}px`;
   caret.style.height = `${blockHeight}px`;
 }
 

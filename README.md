@@ -30,10 +30,11 @@ Edit `.env` and set your key:
 
 ```
 OPENAI_API_KEY=sk-your-actual-key-here
-APP_PASSWORD=your-access-code
 ```
 
 Get a key at [platform.openai.com](https://platform.openai.com/api-keys).
+
+Accounts use a **12-word BIP39 recovery phrase** generated at signup. The phrase is stored on your device until you sign out.
 
 ### 3. Run the app
 

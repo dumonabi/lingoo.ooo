@@ -1,21 +1,88 @@
 const AUTH_KEY = 'lingo-access';
 const USER_KEY = 'lingo-user';
+const RECOVERY_PREFIX = 'lingo-recovery:';
+
+function readPersistedItem(key) {
+  try {
+    return localStorage.getItem(key) || sessionStorage.getItem(key);
+  } catch {
+    return sessionStorage.getItem(key);
+  }
+}
+
+function writePersistedItem(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // ignore storage errors
+  }
+  try {
+    sessionStorage.removeItem(key);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function removePersistedItem(key) {
+  try {
+    localStorage.removeItem(key);
+    sessionStorage.removeItem(key);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function normalizeClientPassphrase(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ');
+}
+
+export function saveRecoveryPhrase(userId, phrase) {
+  if (!userId || !phrase) return;
+  try {
+    localStorage.setItem(`${RECOVERY_PREFIX}${userId}`, normalizeClientPassphrase(phrase));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function getRecoveryPhrase(userId) {
+  if (!userId) return '';
+  try {
+    return localStorage.getItem(`${RECOVERY_PREFIX}${userId}`)?.trim() || '';
+  } catch {
+    return '';
+  }
+}
+
+export function clearRecoveryPhrase(userId) {
+  if (!userId) return;
+  try {
+    localStorage.removeItem(`${RECOVERY_PREFIX}${userId}`);
+  } catch {
+    // ignore storage errors
+  }
+}
 
 export function getAuthToken() {
-  return sessionStorage.getItem(AUTH_KEY);
+  return readPersistedItem(AUTH_KEY);
 }
 
 export function setAuthToken(token) {
-  sessionStorage.setItem(AUTH_KEY, token);
+  const normalized = normalizeClientPassphrase(token);
+  if (!normalized) {
+    clearAuthToken();
+    return;
+  }
+  writePersistedItem(AUTH_KEY, normalized);
 }
 
 export function clearAuthToken() {
-  sessionStorage.removeItem(AUTH_KEY);
+  removePersistedItem(AUTH_KEY);
 }
 
 export function getStoredUser() {
   try {
-    const raw = sessionStorage.getItem(USER_KEY);
+    const raw = readPersistedItem(USER_KEY);
     return raw ? JSON.parse(raw) : null;
   } catch {
     return null;
@@ -24,14 +91,20 @@ export function getStoredUser() {
 
 export function setStoredUser(user) {
   if (!user) {
-    sessionStorage.removeItem(USER_KEY);
+    clearStoredUser();
     return;
   }
-  sessionStorage.setItem(USER_KEY, JSON.stringify(user));
+  writePersistedItem(USER_KEY, JSON.stringify(user));
 }
 
 export function clearStoredUser() {
-  sessionStorage.removeItem(USER_KEY);
+  removePersistedItem(USER_KEY);
+}
+
+export function clearAuthSession(userId = null) {
+  clearAuthToken();
+  clearStoredUser();
+  if (userId) clearRecoveryPhrase(userId);
 }
 
 export function authHeaders(extra = {}) {
@@ -46,8 +119,8 @@ export async function apiFetch(url, options = {}) {
   const res = await fetch(url, { ...options, headers });
 
   if (res.status === 401) {
-    clearAuthToken();
-    clearStoredUser();
+    const user = getStoredUser();
+    clearAuthSession(user?.id);
     window.dispatchEvent(new CustomEvent('lingo:unauthorized'));
   }
 

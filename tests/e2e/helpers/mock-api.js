@@ -35,6 +35,25 @@ export async function setupApiMocks(page, options = {}) {
       });
     }
 
+    if (path === '/api/auth/register') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ok: true,
+          user: {
+            id: 'test-user-new',
+            name: 'User',
+            nativeLanguage: 'en',
+            voiceReady: false,
+            voiceSampleCount: 0,
+            voiceStatus: 'none',
+          },
+          recoveryPhrase: 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+        }),
+      });
+    }
+
     if (path === '/api/languages') {
       return route.fulfill({
         status: 200,

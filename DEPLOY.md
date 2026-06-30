@@ -13,9 +13,8 @@
 | Name | Value | Environments |
 |------|--------|----------------|
 | `OPENAI_API_KEY` | your key (`sk-...`) | Production, Preview, Development |
-| `APP_PASSWORD` | access code for users | Production, Preview, Development |
 
-Never commit `.env` to GitHub.
+Never commit `.env` to GitHub. Users sign in with a **12-word recovery phrase** created in the app (not an env variable).
 
 Set a monthly spending limit at [platform.openai.com/settings/organization/limits](https://platform.openai.com/settings/organization/limits).
 
@@ -57,7 +56,7 @@ Vercel **Hobby** only allows built-in cron once per day. For 5–10 min interval
 | Problem | Fix |
 |--------|-----|
 | `API key not configured` | Add `OPENAI_API_KEY` in Vercel → Settings → Environment Variables, then **Redeploy** |
-| `Unauthorized` | Add or update `APP_PASSWORD` in Vercel, redeploy, share the code with users |
+| `Unauthorized` | Sign in with your 12-word recovery phrase, or create a new account |
 | `Too many messages this hour` | Rate limit (100 messages/hour per IP). Wait or adjust in `server/security.js` |
 | Function timeout / 504 | Upgrade to Vercel Pro, or use shorter voice messages |
 | Mic not working | Use Chrome or Safari, allow microphone permission, site must be HTTPS |

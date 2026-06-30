@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Lingu.ooo">
+  <rect width="512" height="512" rx="112" fill="#050907"/>
+  <path d="M96 304c16-112 112-176 224-144 48 16 80 64 80 120 0 80-80 144-176 144-64 0-112-32-128-80" fill="#22c55e"/>
+  <path d="M176 288c32-48 96-64 160-32 32 16 48 48 48 80 0 48-48 80-112 80-48 0-80-16-96-48" fill="#86efac" opacity="0.92"/>
+  <path d="M320 144c64-16 112 16 128 80 8 40-8 80-40 96" stroke="#166534" stroke-width="20" stroke-linecap="round" fill="none"/>
+  <circle cx="368" cy="128" r="56" fill="#22c55e"/>
+  <circle cx="384" cy="120" r="36" fill="#fff"/>
+  <circle cx="392" cy="116" r="18" fill="#14532d"/>
+  <circle cx="400" cy="108" r="6" fill="#fff"/>
+  <path d="M416 160c24 8 40 32 32 56" stroke="#166534" stroke-width="16" stroke-linecap="round" fill="none"/>
+  <path d="M80 320c-32 48-16 112 32 144" stroke="#4ade80" stroke-width="20" stroke-linecap="round" fill="none"/>
+  <ellipse cx="144" cy="416" rx="40" ry="24" fill="#15803d" transform="rotate(-20 144 416)"/>
+  <ellipse cx="240" cy="432" rx="40" ry="24" fill="#15803d" transform="rotate(-10 240 432)"/>
+  <ellipse cx="336" cy="416" rx="40" ry="24" fill="#15803d" transform="rotate(10 336 416)"/>
+</svg>
